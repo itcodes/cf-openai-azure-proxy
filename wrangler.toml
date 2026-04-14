@@ -1,0 +1,16 @@
+name = "cf-openai-azure-proxy"
+main = "cf-openai-azure-proxy.js"
+compatibility_date = "2025-01-01"
+
+# Non-secret variables. Secrets (AZURE_API_KEY, CLIENT_API_KEYS) are set via:
+#   wrangler secret put AZURE_API_KEY
+#   wrangler secret put CLIENT_API_KEYS
+[vars]
+AZURE_OAI_ENDPOINT      = "https://yoyo.cognitiveservices.azure.com"
+AZURE_INFER_ENDPOINT    = "https://waytoagi.services.ai.azure.com"
+AZURE_OAI_API_VERSION   = "2025-04-01-preview"
+AZURE_INFER_API_VERSION = "2024-05-01-preview"
+
+# Inline MODEL_MAPPING here, or set it via `wrangler secret put MODEL_MAPPING`
+# to keep deployment names out of version control.
+# MODEL_MAPPING = '''{ "gpt-5.4": {"backend":"oai","deployment":"gpt-5.4"}, ... }'''
