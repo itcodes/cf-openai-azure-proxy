@@ -2,15 +2,58 @@ name = "cf-openai-azure-proxy"
 main = "cf-openai-azure-proxy.js"
 compatibility_date = "2025-01-01"
 
-# Non-secret variables. Secrets (AZURE_API_KEY, CLIENT_API_KEYS) are set via:
-#   wrangler secret put AZURE_API_KEY
-#   wrangler secret put CLIENT_API_KEYS
+# Enable logs in Cloudflare dashboard (Workers -> your worker -> Logs)
+[observability]
+enabled = true
+
+# Non-secret variables (visible in dashboard, committed to git).
+# Change these to your own Azure resource hostnames before deploying.
 [vars]
 AZURE_OAI_ENDPOINT      = "https://yoyo.cognitiveservices.azure.com"
 AZURE_INFER_ENDPOINT    = "https://waytoagi.services.ai.azure.com"
 AZURE_OAI_API_VERSION   = "2025-04-01-preview"
 AZURE_INFER_API_VERSION = "2024-05-01-preview"
 
-# Inline MODEL_MAPPING here, or set it via `wrangler secret put MODEL_MAPPING`
-# to keep deployment names out of version control.
-# MODEL_MAPPING = '''{ "gpt-5.4": {"backend":"oai","deployment":"gpt-5.4"}, ... }'''
+# Secrets — set via CLI, never commit them:
+#
+#   wrangler secret put AZURE_API_KEY        # Azure Foundry key (shared across both resources)
+#   wrangler secret put CLIENT_API_KEYS      # sk-xxx,sk-yyy  (comma-separated client allowlist)
+#   wrangler secret put MODEL_MAPPING        # Optional — override the built-in mapping (JSON string)
+#
+# Example MODEL_MAPPING JSON (paste as a single line when running the command):
+# {
+#   "gpt-5.4":               {"backend":"oai",   "deployment":"gpt-5.4"},
+#   "gpt-4o":                {"backend":"oai",   "deployment":"gpt-4o"},
+#   "gpt-4o-mini":           {"backend":"oai",   "deployment":"gpt-4o-mini"},
+#   "o1":                    {"backend":"oai",   "deployment":"o1"},
+#   "o3-mini":               {"backend":"oai",   "deployment":"o3-mini"},
+#   "gpt-image-1":           {"backend":"oai",   "deployment":"gpt-image-1",   "apiVersion":"2024-02-01"},
+#   "gpt-image-1.5":         {"backend":"oai",   "deployment":"gpt-image-1.5", "apiVersion":"2024-02-01"},
+#   "dall-e-3":              {"backend":"oai",   "deployment":"dall-e-3"},
+#   "text-embedding-3-small":{"backend":"oai",   "deployment":"text-embedding-3-small"},
+#   "text-embedding-3-large":{"backend":"oai",   "deployment":"text-embedding-3-large"},
+#   "whisper-1":             {"backend":"oai",   "deployment":"whisper-1"},
+#   "tts-1":                 {"backend":"oai",   "deployment":"tts-1"},
+#   "grok-4-20":             {"backend":"infer", "deployment":"grok-4-20"},
+#   "grok-3":                {"backend":"infer", "deployment":"grok-3"},
+#   "deepseek-r1":           {"backend":"infer", "deployment":"deepseek-r1"},
+#   "deepseek-v3":           {"backend":"infer", "deployment":"deepseek-v3"},
+#   "llama-3.3-70b":         {"backend":"infer", "deployment":"llama-3.3-70b"}
+# }
+
+# ------------------------------------------------------------
+# Deploy steps:
+#   npm i -g wrangler
+#   wrangler login
+#   wrangler secret put AZURE_API_KEY
+#   wrangler secret put CLIENT_API_KEYS
+#   wrangler deploy
+#
+# After deploy, your worker URL is printed. Use {URL}/v1 as the OpenAI
+# base URL in your client software, and a CLIENT_API_KEYS entry as the key.
+# ------------------------------------------------------------
+
+# Optional: bind a custom domain. Replace and uncomment:
+# [[routes]]
+# pattern = "api.yourdomain.com/*"
+# custom_domain = true
