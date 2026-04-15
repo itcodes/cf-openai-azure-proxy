@@ -3,94 +3,203 @@
 <a href="./README_en.md">English</a> |
 <a href="./README.md">中文</a>
 
-> 大多数 OpenAI 客户端不支持 Azure OpenAI / Azure AI Foundry，但 Azure 的申请和绑卡都非常简单，并且还提供了免费的额度。此脚本使用免费的 Cloudflare Worker 作为代理，使得支持 OpenAI 的客户端可以直接使用 Azure AI Foundry 上的各种模型（包括 OpenAI 系、Grok、DeepSeek、Llama 等）。
+> 一个运行在 Cloudflare Workers 上的 OpenAI 兼容代理。它把客户端发来的 `/v1/*` 请求转成 Azure OpenAI / Azure AI Foundry 可接受的上游请求，让只支持 OpenAI API 的客户端也能接入 Azure 上部署的模型。
 
-### 支持模型:
-- GPT 系列（GPT-4o、GPT-5.4、o1、o3 等）
-- 图像生成（DALL-E-3、gpt-image-1、gpt-image-1.5）
-- Embeddings（text-embedding-3-small / large）
-- 语音（Whisper、TTS）
-- Grok 系列（通过 Azure AI Model Inference）
-- DeepSeek / Llama 等第三方模型（通过 Azure AI Model Inference）
+## 这个项目做什么
 
-模型子类添加非常容易, 参考下面的使用说明。
+很多客户端只支持 OpenAI 风格接口，但不直接支持 Azure OpenAI / Azure AI Foundry。本项目提供一个很轻量的协议转换层：
 
-### 项目说明:
-- 我没有服务器可以使用吗?
-    - 这段脚本跑在 Cloudflare Worker, 不需要服务器, 不需要绑卡, 每天 10W 次请求 免费
-- 我没有自己的域名可以使用吗?
-    - 也可以, 参考: https://github.com/haibbo/cf-openai-azure-proxy/issues/3
-- 同时支持哪些 Azure 接口形态？
-    - 经典 Azure OpenAI（`/openai/deployments/{name}/*`）
-    - Responses API（`/openai/responses`，对应客户端的 `/v1/responses`）
-    - Azure AI Model Inference（`/models/*`，跑 Grok/DeepSeek/Llama 等非 OpenAI 模型）
-- 一个 Worker 能不能同时代理多个 Azure 资源？
-    - 可以。本项目设计成 `AZURE_OAI_ENDPOINT`（OpenAI 资源）+ `AZURE_INFER_ENDPOINT`（AI Foundry 第三方模型资源）并存
-- 流式响应支持吗？
-    - 支持。SSE 原生透传，无人为延迟
-- 项目也支持 Docker 部署（基于 wrangler）
+- 客户端继续按 OpenAI 方式请求 `/v1/chat/completions`、`/v1/responses`、`/v1/embeddings` 等接口
+- Cloudflare Worker 根据 `model` 字段查找映射关系
+- 再把请求转发到 Azure OpenAI 或 Azure AI Model Inference
 
-### 部署
-代理 OpenAI 的请求到 Azure AI Foundry，代码部署步骤：
+它是一个无状态代理，不是聊天应用本体，也不包含数据库、计费、用户系统或管理后台。
 
-1. 注册并登录到 Cloudflare 账户
-2. 创建一个新的 Cloudflare Worker
-3. 将 [cf-openai-azure-proxy.js](./cf-openai-azure-proxy.js) 复制并粘贴到 Cloudflare Worker 编辑器中
-4. 通过环境变量配置 `AZURE_OAI_ENDPOINT`、`AZURE_API_KEY` 等（详见下方"使用说明"）
-5. 保存并部署 Cloudflare Worker
-6. **可选**绑定自定义域名: 在 Worker 详情页 -> Trigger -> Custom Domains 中为这个 Worker 添加一个自定义域名，参考 https://github.com/haibbo/cf-openai-azure-proxy/issues/3
+## 当前支持的能力
 
-也可以用 wrangler CLI 部署：
+- OpenAI 兼容入口
+  - `POST /v1/chat/completions`
+  - `POST /v1/responses`
+  - `POST /v1/completions`
+  - `POST /v1/embeddings`
+  - `POST /v1/images/generations`
+  - `POST /v1/audio/speech`
+  - `POST /v1/audio/transcriptions`
+  - `POST /v1/audio/translations`
+  - `POST /v1/images/edits`
+  - `POST /v1/images/variations`
+  - `GET /v1/models`
+- Azure OpenAI 经典接口
+  - `/openai/deployments/{deployment}/*`
+- Azure OpenAI Responses API
+  - `/openai/responses`
+- Azure AI Model Inference
+  - `/models/*`
+- SSE 流式透传
+- 简单客户端鉴权
+  - 用 `CLIENT_API_KEYS` 给你的 Worker 再包一层访问控制
+
+## 支持的模型类型
+
+默认映射里已经给了这些示例：
+
+- GPT 系列
+  - `gpt-5.4`
+  - `gpt-4o`
+  - `gpt-4o-mini`
+  - `o1`
+  - `o3-mini`
+- 图像
+  - `gpt-image-1`
+  - `gpt-image-1.5`
+  - `dall-e-3`
+- Embeddings
+  - `text-embedding-3-small`
+  - `text-embedding-3-large`
+- 语音
+  - `whisper-1`
+  - `tts-1`
+- Azure AI Foundry 第三方模型
+  - `grok-4-20`
+  - `grok-3`
+  - `deepseek-r1`
+  - `deepseek-v3`
+  - `llama-3.3-70b`
+
+实际可用模型取决于你在 Azure 中部署了什么，以及 `MODEL_MAPPING` 如何配置。
+
+## 工作方式
+
+请求链路如下：
+
+```text
+OpenAI-compatible client
+  -> /v1/chat/completions | /v1/responses | /v1/embeddings | ...
+  -> Cloudflare Worker
+  -> 校验 Authorization / CLIENT_API_KEYS
+  -> 读取 body.model
+  -> 根据 MODEL_MAPPING 找到 backend + deployment
+  -> 转发到对应 Azure 上游
+     - backend=oai   -> {AZURE_OAI_ENDPOINT}/openai/...
+     - backend=infer -> {AZURE_INFER_ENDPOINT}/models/...
+  -> 把响应原样返回给客户端
+```
+
+## 环境变量
+
+在 Cloudflare Workers 的 Variables / Secrets 中配置：
+
+| 变量 | 必填 | 说明 |
+|---|---|---|
+| `AZURE_API_KEY` | 推荐 | Azure API Key。设置后，Worker 用它访问 Azure |
+| `AZURE_OAI_ENDPOINT` | 使用 Azure OpenAI 时必填 | 例如 `https://your-resource.cognitiveservices.azure.com` |
+| `AZURE_INFER_ENDPOINT` | 使用 Azure AI Model Inference 时必填 | 例如 `https://your-project.services.ai.azure.com` |
+| `CLIENT_API_KEYS` | 推荐 | 逗号分隔，作为客户端访问你这个代理时使用的 key |
+| `AZURE_OAI_API_VERSION` | 否 | 默认 `2025-04-01-preview` |
+| `AZURE_INFER_API_VERSION` | 否 | 默认 `2024-05-01-preview` |
+| `MODEL_MAPPING` | 否 | JSON 字符串；不填时使用代码内置默认映射 |
+
+说明：
+
+- 如果设置了 `CLIENT_API_KEYS`，客户端必须用其中某个 key 访问 Worker
+- 如果没有设置 `CLIENT_API_KEYS`，Worker 会放行客户端请求
+- 如果同时也没有设置 `AZURE_API_KEY`，则会尝试把客户端 `Authorization: Bearer ...` 当作 Azure key 继续透传
+
+## MODEL_MAPPING 格式
+
+`MODEL_MAPPING` 是一个 JSON 对象，key 是客户端使用的模型名，value 描述这个模型要转发到哪个 Azure 后端和 deployment。
+
+示例：
+
+```json
+{
+  "gpt-5.4": {
+    "backend": "oai",
+    "deployment": "gpt-5.4"
+  },
+  "gpt-4o": {
+    "backend": "oai",
+    "deployment": "gpt-4o"
+  },
+  "grok-4-20": {
+    "backend": "infer",
+    "deployment": "grok-4-20"
+  },
+  "deepseek-r1": {
+    "backend": "infer",
+    "deployment": "deepseek-r1"
+  }
+}
+```
+
+规则：
+
+- `backend: "oai"` 表示走 Azure OpenAI
+- `backend: "infer"` 表示走 Azure AI Model Inference
+- `deployment` 填你在 Azure 中实际创建的 deployment 名
+- 可选 `apiVersion` 可覆盖默认 API 版本
+
+## 部署方式
+
+当前推荐方式是直接用 Wrangler 部署 Cloudflare Worker。
+
+### 1. 准备项目
 
 ```bash
 npm i -g wrangler
 wrangler login
+```
+
+### 2. 配置变量
+
+`wrangler.toml` 中的 `[vars]` 可放非敏感配置，例如：
+
+```toml
+[vars]
+AZURE_OAI_ENDPOINT      = "https://your-resource.cognitiveservices.azure.com"
+AZURE_INFER_ENDPOINT    = "https://your-project.services.ai.azure.com"
+AZURE_OAI_API_VERSION   = "2025-04-01-preview"
+AZURE_INFER_API_VERSION = "2024-05-01-preview"
+```
+
+敏感信息使用 secret：
+
+```bash
 wrangler secret put AZURE_API_KEY
 wrangler secret put CLIENT_API_KEYS
+wrangler secret put MODEL_MAPPING
+```
+
+### 3. 部署
+
+```bash
 wrangler deploy
 ```
 
-### 使用说明
+部署完成后，会拿到一个 Worker URL。把 `{WORKER_URL}/v1` 配到你的 OpenAI 兼容客户端即可。
 
-先得到 Azure 资源名和各个 deployment 名, 登录到 Azure AI Foundry 后台查看。
+## 客户端怎么填
 
-#### 环境变量列表
+以 OpenAI 兼容客户端为例：
 
-| 变量 | 必填 | 说明 |
-|---|---|---|
-| `AZURE_API_KEY` | ✅ | Azure 密钥（Secret） |
-| `AZURE_OAI_ENDPOINT` | ✅ | 例 `https://yoyo.cognitiveservices.azure.com` |
-| `AZURE_INFER_ENDPOINT` | 用 Grok/DeepSeek 才要 | 例 `https://waytoagi.services.ai.azure.com` |
-| `CLIENT_API_KEYS` | 推荐 | 逗号分隔，例 `sk-mykey1,sk-mykey2` |
-| `AZURE_OAI_API_VERSION` | ⬜ | 默认 `2025-04-01-preview` |
-| `AZURE_INFER_API_VERSION` | ⬜ | 默认 `2024-05-01-preview` |
-| `MODEL_MAPPING` | ⬜ | JSON 字符串，不填用代码内置默认映射 |
+- Base URL: `https://your-worker.your-subdomain.workers.dev/v1`
+- API Key: `CLIENT_API_KEYS` 中你自定义的某个 key
 
-<img width="777" src="https://user-images.githubusercontent.com/1295315/233384224-aa6581f0-26a4-49cf-ae25-4dfb466143da.png" alt="env" />
+对于支持新版 Responses API 的客户端，同样填这个 Base URL 即可，代理会把 `/v1/responses` 自动转给 Azure 的 `/openai/responses`。
 
-#### 这里有两种做法:
+## 注意事项
 
-- 直接修改代码顶部 `DEFAULT_MAPPING` 的值, 如:
+- `GET /v1/models` 返回的是映射表里的模型列表，不是 Azure 自动探测结果
+- 只有配置了相应 endpoint 和 deployment 的模型才能真正调用成功
+- 本项目默认只做协议转换和透传，不做重试、缓存、配额、审计或多租户管理
+- 仓库也提供 Docker 镜像，主要用于本地运行 `wrangler dev --local`；部署到 Cloudflare 仍推荐直接使用 Wrangler
 
-```js
-const DEFAULT_MAPPING = {
-  "gpt-4o":       { backend: "oai",   deployment: "gpt-4o" },
-  "gpt-5.4":      { backend: "oai",   deployment: "gpt-5.4" },
-  "dall-e-3":     { backend: "oai",   deployment: "dall-e-3" },
-  "grok-4-20":    { backend: "infer", deployment: "grok-4-20" },
-  "deepseek-r1":  { backend: "infer", deployment: "deepseek-r1" },
-};
-// 其他的 map 规则直接按这样的格式续写即可
-// backend: "oai" 走 Azure OpenAI，"infer" 走 Azure AI Model Inference
-```
+## 主要文件
 
-- 或者通过 cloudflare worker 控制台, 进入 Workers script > Settings > Variables and Secrets, 把整个 JSON 作为 `MODEL_MAPPING` 变量填进去。
+- [cf-openai-azure-proxy.js](./cf-openai-azure-proxy.js): 当前主 Worker 实现
+- [wrangler.toml](./wrangler.toml): Worker 配置
+- [cf-openai-palm-proxy.js](./cf-openai-palm-proxy.js): 早期 PaLM 代理脚本，和当前 Azure 主实现无关
 
-### 客户端
-以 OpenCat 为例: 自定义 API 域名填写绑定的域名（加 `/v1` 后缀），API Key 填 `CLIENT_API_KEYS` 里你自己设的某个 `sk-xxx`：
+## License
 
-<img width="339" src="https://user-images.githubusercontent.com/1295315/229820705-ab2ad1d1-8795-4670-97b4-16a0f9fdebba.png" alt="opencat" />
-
-对于支持 Responses API 的新版客户端（Cherry Studio、ChatWise 等），同样填上面的 base URL 即可，代理会自动把 `/v1/responses` 转给 Azure。
-
-我已经尝试了多种客户端, 如果遇到其他客户端有问题, 欢迎创建 issue。
+[MIT](./LICENSE)
