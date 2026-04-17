@@ -13,10 +13,12 @@ AZURE_OAI_ENDPOINT      = "https://yoyo.cognitiveservices.azure.com"
 AZURE_INFER_ENDPOINT    = "https://waytoagi.services.ai.azure.com"
 AZURE_OAI_API_VERSION   = "2025-04-01-preview"
 AZURE_INFER_API_VERSION = "2024-05-01-preview"
+# ALLOWED_ORIGINS       = "https://chat.example.com"
+# UPSTREAM_TIMEOUT_MS   = "30000"
 
 # Secrets — set via CLI, never commit them:
 #
-#   wrangler secret put AZURE_API_KEY        # Azure Foundry key (shared across both resources)
+#   wrangler secret put AZURE_API_KEY        # Required if CLIENT_API_KEYS is configured
 #   wrangler secret put CLIENT_API_KEYS      # sk-xxx,sk-yyy  (comma-separated client allowlist)
 #   wrangler secret put MODEL_MAPPING        # Optional — override the built-in mapping (JSON string)
 #

@@ -5,13 +5,35 @@
 //   3. Azure Model Inference  : {INFER}/models/{endpoint}?api-version=... (model in body, no deployment in URL)
 //
 // Required env vars (set in Workers dashboard -> Settings -> Variables):
-//   AZURE_API_KEY            (Secret) Shared key for both resources
+//   AZURE_API_KEY            (Secret) Shared key for both resources when CLIENT_API_KEYS is enabled
 //   AZURE_OAI_ENDPOINT       e.g. https://yoyo.cognitiveservices.azure.com
 //   AZURE_INFER_ENDPOINT     e.g. https://waytoagi.services.ai.azure.com
 //   AZURE_OAI_API_VERSION    default 2025-04-01-preview
 //   AZURE_INFER_API_VERSION  default 2024-05-01-preview
 //   MODEL_MAPPING            JSON string, see DEFAULT_MAPPING below
 //   CLIENT_API_KEYS          comma-separated list, e.g. sk-abc,sk-def (optional but recommended)
+//   ALLOWED_ORIGINS          comma-separated browser origins allowed by CORS (optional)
+//   UPSTREAM_TIMEOUT_MS      timeout for upstream Azure requests in milliseconds (optional)
+
+const DEFAULT_OAI_API_VERSION = "2025-04-01-preview";
+const DEFAULT_INFER_API_VERSION = "2024-05-01-preview";
+const DEFAULT_UPSTREAM_TIMEOUT_MS = 30000;
+const DEFAULT_CORS_ALLOW_HEADERS = "Authorization, Content-Type";
+const DEFAULT_CORS_EXPOSE_HEADERS = "openai-processing-ms, x-request-id";
+const SAFE_RESPONSE_HEADERS = new Set([
+  "cache-control",
+  "content-disposition",
+  "content-encoding",
+  "content-language",
+  "content-type",
+  "openai-processing-ms",
+  "retry-after",
+  "x-request-id"
+]);
+const TEXT_ENCODER = new TextEncoder();
+
+let cachedModelMappingRaw = null;
+let cachedModelMapping = null;
 
 const DEFAULT_MAPPING = {
   // OpenAI-family on yoyo (classic + responses share the same entry;
@@ -39,23 +61,21 @@ const DEFAULT_MAPPING = {
   "llama-3.3-70b":         { backend: "infer", deployment: "llama-3.3-70b" }
 };
 
-const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "*"
-};
-
 export default {
   async fetch(request, env) {
+    let cfg;
     try {
+      cfg = loadConfig(env);
+
+      const originErr = checkOrigin(request, cfg);
+      if (originErr) return originErr;
+
       if (request.method === "OPTIONS") {
-        return new Response(null, { headers: CORS_HEADERS });
+        return new Response(null, { headers: getCorsHeaders(request, cfg) });
       }
 
-      const cfg = loadConfig(env);
       const url = new URL(request.url);
-      let path = url.pathname.replace(/\/+/g, "/");
-      if (path.startsWith("/v1/")) path = path.slice(3);
+      const path = normalizeClientPath(url.pathname);
 
       // Client auth
       const authErr = checkClientAuth(request, cfg);
@@ -63,7 +83,7 @@ export default {
 
       // Routes that don't need model lookup
       if (path === "/models" && request.method === "GET") {
-        return listModels(cfg);
+        return listModels(cfg, request);
       }
 
       // Multipart routes (audio + image edits) — must not json-parse the body
@@ -74,82 +94,165 @@ export default {
 
       // JSON routes
       if (request.method !== "POST") {
-        return errorResponse(404, "not_found", `No handler for ${request.method} ${path}`);
+        return errorResponse(404, "not_found", `No handler for ${request.method} ${path}`, request, cfg);
       }
 
       const body = await request.json().catch(() => null);
-      if (!body) return errorResponse(400, "invalid_request_error", "Request body must be valid JSON");
+      if (!body) {
+        return errorResponse(400, "invalid_request_error", "Request body must be valid JSON", request, cfg);
+      }
 
       const modelName = body.model;
-      if (!modelName) return errorResponse(400, "invalid_request_error", "Missing 'model' field in request body");
+      if (!modelName) {
+        return errorResponse(400, "invalid_request_error", "Missing 'model' field in request body", request, cfg, "model");
+      }
 
       const entry = cfg.mapping[modelName];
-      if (!entry) return errorResponse(400, "model_not_found", `Model '${modelName}' is not mapped. Update MODEL_MAPPING env var.`);
+      if (!entry) {
+        return errorResponse(400, "model_not_found", `Model '${modelName}' is not mapped. Update MODEL_MAPPING env var.`, request, cfg, "model");
+      }
 
       // Route by client path + backend
       const azureKey = resolveAzureKey(request, cfg);
       if (path === "/chat/completions") {
-        return proxyChatCompletions(body, entry, cfg, azureKey);
+        return proxyChatCompletions(request, body, entry, cfg, azureKey);
       }
       if (path === "/responses") {
-        return proxyResponses(body, entry, cfg, azureKey);
+        return proxyResponses(request, body, entry, cfg, azureKey);
       }
       if (path === "/completions") {
-        return proxyClassic(body, entry, cfg, "completions", azureKey);
+        return proxyClassic(request, body, entry, cfg, "completions", azureKey);
       }
       if (path === "/embeddings") {
-        if (entry.backend === "infer") return proxyInference(body, entry, cfg, "embeddings", azureKey);
-        return proxyClassic(body, entry, cfg, "embeddings", azureKey);
+        if (entry.backend === "infer") return proxyInference(request, body, entry, cfg, "embeddings", azureKey);
+        return proxyClassic(request, body, entry, cfg, "embeddings", azureKey);
       }
       if (path === "/images/generations") {
-        return proxyClassic(body, entry, cfg, "images/generations", azureKey);
+        return proxyClassic(request, body, entry, cfg, "images/generations", azureKey);
       }
       if (path === "/audio/speech") {
-        return proxyClassic(body, entry, cfg, "audio/speech", azureKey);
+        return proxyClassic(request, body, entry, cfg, "audio/speech", azureKey);
       }
 
-      return errorResponse(404, "not_found", `Unsupported path: ${url.pathname}`);
+      return errorResponse(404, "not_found", `Unsupported path: ${url.pathname}`, request, cfg);
     } catch (e) {
-      return errorResponse(500, "proxy_error", e.message || String(e));
+      return errorResponse(500, "proxy_error", e.message || String(e), request, cfg);
     }
   }
 };
 
 function loadConfig(env) {
-  let mapping = DEFAULT_MAPPING;
-  if (env.MODEL_MAPPING) {
-    try {
-      mapping = JSON.parse(env.MODEL_MAPPING);
-    } catch (e) {
-      throw new Error("MODEL_MAPPING is not valid JSON: " + e.message);
-    }
-  }
+  const mapping = parseModelMapping(env.MODEL_MAPPING || "");
+  const clientKeys = splitCsv(env.CLIENT_API_KEYS || "");
+  const allowedOrigins = splitCsv(env.ALLOWED_ORIGINS || "");
+  const azureKey = (env.AZURE_API_KEY || "").trim();
 
-  const clientKeys = (env.CLIENT_API_KEYS || "")
-    .split(",").map(s => s.trim()).filter(Boolean);
+  if (clientKeys.length > 0 && !azureKey) {
+    throw new Error("AZURE_API_KEY is required when CLIENT_API_KEYS is configured");
+  }
 
   return {
     mapping,
     clientKeys,
-    azureKey: env.AZURE_API_KEY || "",
+    allowedOrigins,
+    azureKey,
     oaiEndpoint: stripTrailingSlash(env.AZURE_OAI_ENDPOINT || ""),
     inferEndpoint: stripTrailingSlash(env.AZURE_INFER_ENDPOINT || ""),
-    oaiApiVersion: env.AZURE_OAI_API_VERSION || "2025-04-01-preview",
-    inferApiVersion: env.AZURE_INFER_API_VERSION || "2024-05-01-preview"
+    oaiApiVersion: env.AZURE_OAI_API_VERSION || DEFAULT_OAI_API_VERSION,
+    inferApiVersion: env.AZURE_INFER_API_VERSION || DEFAULT_INFER_API_VERSION,
+    upstreamTimeoutMs: parseUpstreamTimeoutMs(env.UPSTREAM_TIMEOUT_MS || "")
   };
 }
 
-function stripTrailingSlash(s) { return s.replace(/\/+$/, ""); }
+function parseModelMapping(raw) {
+  if (raw === cachedModelMappingRaw) return cachedModelMapping;
+
+  if (!raw) {
+    cachedModelMappingRaw = raw;
+    cachedModelMapping = DEFAULT_MAPPING;
+    return cachedModelMapping;
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    throw new Error("MODEL_MAPPING is not valid JSON: " + e.message);
+  }
+
+  if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") {
+    throw new Error("MODEL_MAPPING must be a JSON object");
+  }
+
+  cachedModelMappingRaw = raw;
+  cachedModelMapping = parsed;
+  return cachedModelMapping;
+}
+
+function parseUpstreamTimeoutMs(raw) {
+  if (!raw.trim()) return DEFAULT_UPSTREAM_TIMEOUT_MS;
+  const timeout = Number.parseInt(raw, 10);
+  if (!Number.isFinite(timeout) || timeout <= 0) {
+    throw new Error("UPSTREAM_TIMEOUT_MS must be a positive integer");
+  }
+  return timeout;
+}
+
+function splitCsv(raw) {
+  return raw.split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+function normalizeClientPath(pathname) {
+  const normalized = pathname.replace(/\/+/g, "/");
+  const withoutPrefix = normalized.replace(/^\/v1(?=\/|$)/, "");
+  return withoutPrefix || "/";
+}
+
+function stripTrailingSlash(s) {
+  return s.replace(/\/+$/, "");
+}
+
+function checkOrigin(request, cfg) {
+  if (cfg.allowedOrigins.length === 0) return null;
+
+  const origin = request.headers.get("Origin");
+  if (!origin) return null;
+
+  if (!cfg.allowedOrigins.includes(origin)) {
+    return errorResponse(403, "origin_not_allowed", "Origin is not allowed", request, cfg);
+  }
+  return null;
+}
 
 function checkClientAuth(request, cfg) {
   // If no CLIENT_API_KEYS configured, allow through (legacy mode: client supplies Azure key).
   if (cfg.clientKeys.length === 0) return null;
+
   const auth = request.headers.get("Authorization") || "";
   const key = auth.replace(/^Bearer\s+/i, "").trim();
-  if (!key || !cfg.clientKeys.includes(key)) {
-    return errorResponse(401, "invalid_api_key", "Invalid API key");
+  if (!key || !hasMatchingClientKey(key, cfg.clientKeys)) {
+    return errorResponse(401, "invalid_api_key", "Invalid API key", request, cfg);
   }
   return null;
+}
+
+function hasMatchingClientKey(key, clientKeys) {
+  for (const candidate of clientKeys) {
+    if (timingSafeEqual(key, candidate)) return true;
+  }
+  return false;
+}
+
+function timingSafeEqual(a, b) {
+  const left = TEXT_ENCODER.encode(a);
+  const right = TEXT_ENCODER.encode(b);
+  const maxLen = Math.max(left.length, right.length);
+  let diff = left.length ^ right.length;
+
+  for (let i = 0; i < maxLen; i += 1) {
+    diff |= (left[i] || 0) ^ (right[i] || 0);
+  }
+  return diff === 0;
 }
 
 function resolveAzureKey(request, cfg) {
@@ -158,75 +261,134 @@ function resolveAzureKey(request, cfg) {
   return auth.replace(/^Bearer\s+/i, "").trim();
 }
 
-async function proxyChatCompletions(body, entry, cfg, azureKey) {
+async function proxyChatCompletions(request, body, entry, cfg, azureKey) {
   if (entry.backend === "infer") {
-    return proxyInference(body, entry, cfg, "chat/completions", azureKey);
+    return proxyInference(request, body, entry, cfg, "chat/completions", azureKey);
   }
-  return proxyClassic(body, entry, cfg, "chat/completions", azureKey);
+  return proxyClassic(request, body, entry, cfg, "chat/completions", azureKey);
 }
 
-async function proxyResponses(body, entry, cfg, azureKey) {
+async function proxyResponses(request, body, entry, cfg, azureKey) {
   if (entry.backend !== "oai") {
-    return errorResponse(400, "invalid_request_error",
-      `Model '${body.model}' is on backend '${entry.backend}' which does not support /v1/responses`);
+    return errorResponse(
+      400,
+      "invalid_request_error",
+      `Model '${body.model}' is on backend '${entry.backend}' which does not support /v1/responses`,
+      request,
+      cfg,
+      "model"
+    );
   }
+  if (!cfg.oaiEndpoint) {
+    return errorResponse(500, "proxy_error", "AZURE_OAI_ENDPOINT is not set", request, cfg);
+  }
+
   const apiVersion = entry.apiVersion || cfg.oaiApiVersion;
   const upstream = `${cfg.oaiEndpoint}/openai/responses?api-version=${apiVersion}`;
   const upstreamBody = { ...body, model: entry.deployment };
-  return doFetch(upstream, upstreamBody, azureKey);
+  return fetchJsonUpstream(request, cfg, upstream, azureKey, upstreamBody);
 }
 
-async function proxyClassic(body, entry, cfg, endpoint, azureKey) {
+async function proxyClassic(request, body, entry, cfg, endpoint, azureKey) {
   if (entry.backend !== "oai") {
-    return errorResponse(400, "invalid_request_error",
-      `Model '${body.model}' is on backend '${entry.backend}' which does not support /${endpoint}`);
+    return errorResponse(
+      400,
+      "invalid_request_error",
+      `Model '${body.model}' is on backend '${entry.backend}' which does not support /${endpoint}`,
+      request,
+      cfg,
+      "model"
+    );
   }
+  if (!cfg.oaiEndpoint) {
+    return errorResponse(500, "proxy_error", "AZURE_OAI_ENDPOINT is not set", request, cfg);
+  }
+
   const apiVersion = entry.apiVersion || cfg.oaiApiVersion;
   const upstream = `${cfg.oaiEndpoint}/openai/deployments/${entry.deployment}/${endpoint}?api-version=${apiVersion}`;
   // Keep `model` in body as the deployment name — harmless for chat/completions,
   // required by some endpoints (e.g. gpt-image-1 images/generations).
   const upstreamBody = { ...body, model: entry.deployment };
-  return doFetch(upstream, upstreamBody, azureKey);
+  return fetchJsonUpstream(request, cfg, upstream, azureKey, upstreamBody);
 }
 
-async function proxyInference(body, entry, cfg, endpoint, azureKey) {
+async function proxyInference(request, body, entry, cfg, endpoint, azureKey) {
   if (!cfg.inferEndpoint) {
-    return errorResponse(500, "proxy_error", "AZURE_INFER_ENDPOINT is not set");
+    return errorResponse(500, "proxy_error", "AZURE_INFER_ENDPOINT is not set", request, cfg);
   }
+
   const upstream = `${cfg.inferEndpoint}/models/${endpoint}?api-version=${cfg.inferApiVersion}`;
   const upstreamBody = { ...body, model: entry.deployment };
-  return doFetch(upstream, upstreamBody, azureKey);
+  return fetchJsonUpstream(request, cfg, upstream, azureKey, upstreamBody);
 }
 
-async function doFetch(upstreamUrl, body, azureKey) {
-  if (!azureKey) {
-    return errorResponse(500, "proxy_error", "No Azure API key available (set AZURE_API_KEY or send Authorization header)");
-  }
-  const resp = await fetch(upstreamUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "api-key": azureKey,
-      "Authorization": `Bearer ${azureKey}`
-    },
-    body: JSON.stringify(body)
-  });
+async function fetchJsonUpstream(request, cfg, upstreamUrl, azureKey, body) {
+  return fetchUpstream(
+    request,
+    cfg,
+    upstreamUrl,
+    azureKey,
+    JSON.stringify(body),
+    { "Content-Type": "application/json" }
+  );
+}
 
-  const headers = new Headers(resp.headers);
-  for (const [k, v] of Object.entries(CORS_HEADERS)) headers.set(k, v);
-  // Streams: let Workers pipe the body through natively.
-  return new Response(resp.body, { status: resp.status, headers });
+async function fetchUpstream(request, cfg, upstreamUrl, azureKey, body, extraHeaders = {}) {
+  if (!azureKey) {
+    return errorResponse(500, "proxy_error", "No Azure API key available (set AZURE_API_KEY or send Authorization header)", request, cfg);
+  }
+
+  const headers = new Headers(extraHeaders);
+  headers.set("api-key", azureKey);
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), cfg.upstreamTimeoutMs);
+
+  try {
+    const resp = await fetch(upstreamUrl, {
+      method: "POST",
+      headers,
+      body,
+      signal: controller.signal
+    });
+
+    return new Response(resp.body, {
+      status: resp.status,
+      headers: buildClientResponseHeaders(resp.headers, request, cfg)
+    });
+  } catch (e) {
+    if (e && e.name === "AbortError") {
+      return errorResponse(
+        504,
+        "upstream_timeout",
+        `Azure upstream timed out after ${cfg.upstreamTimeoutMs}ms`,
+        request,
+        cfg
+      );
+    }
+    throw e;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 async function proxyMultipart(request, path, cfg) {
   // Parse form to extract `model`, then rebuild (so we can still stream file parts).
   const form = await request.formData();
   const modelName = form.get("model");
-  if (!modelName) return errorResponse(400, "invalid_request_error", "Missing 'model' field in form");
+  if (typeof modelName !== "string" || !modelName) {
+    return errorResponse(400, "invalid_request_error", "Missing 'model' field in form", request, cfg, "model");
+  }
+
   const entry = cfg.mapping[modelName];
-  if (!entry) return errorResponse(400, "model_not_found", `Model '${modelName}' is not mapped`);
+  if (!entry) {
+    return errorResponse(400, "model_not_found", `Model '${modelName}' is not mapped`, request, cfg, "model");
+  }
   if (entry.backend !== "oai") {
-    return errorResponse(400, "invalid_request_error", `Model '${modelName}' does not support /${path}`);
+    return errorResponse(400, "invalid_request_error", `Model '${modelName}' does not support /${path}`, request, cfg, "model");
+  }
+  if (!cfg.oaiEndpoint) {
+    return errorResponse(500, "proxy_error", "AZURE_OAI_ENDPOINT is not set", request, cfg);
   }
 
   // Rebuild form without `model` (classic endpoint ignores it; some reject)
@@ -241,31 +403,82 @@ async function proxyMultipart(request, path, cfg) {
   const upstream = `${cfg.oaiEndpoint}/openai/deployments/${entry.deployment}/${upstreamPath}?api-version=${apiVersion}`;
   const azureKey = resolveAzureKey(request, cfg);
 
-  const resp = await fetch(upstream, {
-    method: "POST",
-    headers: { "api-key": azureKey, "Authorization": `Bearer ${azureKey}` },
-    body: upstreamForm
-  });
-  const headers = new Headers(resp.headers);
-  for (const [k, v] of Object.entries(CORS_HEADERS)) headers.set(k, v);
-  return new Response(resp.body, { status: resp.status, headers });
+  return fetchUpstream(request, cfg, upstream, azureKey, upstreamForm);
 }
 
-function listModels(cfg) {
-  const data = Object.keys(cfg.mapping).map(id => ({
+function buildClientResponseHeaders(upstreamHeaders, request, cfg) {
+  const headers = new Headers();
+
+  for (const [key, value] of upstreamHeaders.entries()) {
+    if (SAFE_RESPONSE_HEADERS.has(key.toLowerCase())) {
+      headers.set(key, value);
+    }
+  }
+
+  const corsHeaders = getCorsHeaders(request, cfg);
+  for (const [key, value] of corsHeaders.entries()) {
+    headers.set(key, value);
+  }
+  return headers;
+}
+
+function getCorsHeaders(request, cfg) {
+  const headers = new Headers();
+  const origin = request.headers.get("Origin");
+  const allowOrigin = resolveAllowedOrigin(origin, cfg);
+
+  if (allowOrigin) {
+    headers.set("Access-Control-Allow-Origin", allowOrigin);
+  }
+  headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  headers.set("Access-Control-Allow-Headers", request.headers.get("Access-Control-Request-Headers") || DEFAULT_CORS_ALLOW_HEADERS);
+  headers.set("Access-Control-Expose-Headers", DEFAULT_CORS_EXPOSE_HEADERS);
+  headers.set("Access-Control-Max-Age", "86400");
+
+  if (cfg && cfg.allowedOrigins.length > 0) appendVary(headers, "Origin");
+  if (request.headers.get("Access-Control-Request-Headers")) appendVary(headers, "Access-Control-Request-Headers");
+
+  return headers;
+}
+
+function resolveAllowedOrigin(origin, cfg) {
+  if (!cfg || cfg.allowedOrigins.length === 0) return "*";
+  if (!origin) return "";
+  return cfg.allowedOrigins.includes(origin) ? origin : "";
+}
+
+function appendVary(headers, value) {
+  const existing = headers.get("Vary");
+  if (!existing) {
+    headers.set("Vary", value);
+    return;
+  }
+
+  const values = existing.split(",").map((part) => part.trim()).filter(Boolean);
+  if (!values.includes(value)) values.push(value);
+  headers.set("Vary", values.join(", "));
+}
+
+function listModels(cfg, request) {
+  const created = Math.floor(Date.now() / 1000);
+  const data = Object.keys(cfg.mapping).map((id) => ({
     id,
     object: "model",
-    created: 1677610602,
+    created,
     owned_by: cfg.mapping[id].backend === "infer" ? "azure-inference" : "azure-openai"
   }));
+
   return new Response(JSON.stringify({ object: "list", data }, null, 2), {
-    headers: { "Content-Type": "application/json", ...CORS_HEADERS }
+    headers: buildClientResponseHeaders(new Headers({ "Content-Type": "application/json" }), request, cfg)
   });
 }
 
-function errorResponse(status, type, message) {
+function errorResponse(status, type, message, request, cfg, param = null) {
   return new Response(
-    JSON.stringify({ error: { message, type, code: type } }),
-    { status, headers: { "Content-Type": "application/json", ...CORS_HEADERS } }
+    JSON.stringify({ error: { message, type, param, code: type } }),
+    {
+      status,
+      headers: buildClientResponseHeaders(new Headers({ "Content-Type": "application/json" }), request, cfg)
+    }
   );
 }

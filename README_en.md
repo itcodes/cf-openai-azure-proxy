@@ -92,15 +92,19 @@ Configure these in Cloudflare Workers Variables / Secrets:
 | `AZURE_OAI_ENDPOINT` | Required for Azure OpenAI | Example: `https://your-resource.cognitiveservices.azure.com` |
 | `AZURE_INFER_ENDPOINT` | Required for Azure AI Model Inference | Example: `https://your-project.services.ai.azure.com` |
 | `CLIENT_API_KEYS` | Recommended | Comma-separated keys accepted by your proxy |
+| `ALLOWED_ORIGINS` | No | Comma-separated browser origins allowed by CORS, for example `https://chat.example.com` |
 | `AZURE_OAI_API_VERSION` | No | Defaults to `2025-04-01-preview` |
 | `AZURE_INFER_API_VERSION` | No | Defaults to `2024-05-01-preview` |
+| `UPSTREAM_TIMEOUT_MS` | No | Timeout for Azure upstream requests, defaults to `30000` |
 | `MODEL_MAPPING` | No | JSON string; falls back to the built-in default mapping |
 
 Notes:
 
 - if `CLIENT_API_KEYS` is set, clients must use one of those keys to access the proxy
+- if `CLIENT_API_KEYS` is set, `AZURE_API_KEY` must also be set so client keys are never forwarded upstream by mistake
 - if `CLIENT_API_KEYS` is not set, client auth is skipped
-- if `AZURE_API_KEY` is also not set, the Worker will try to forward the client's `Authorization: Bearer ...` value as the Azure key
+- if `CLIENT_API_KEYS` is not set and `AZURE_API_KEY` is also not set, the Worker will try to forward the client's `Authorization: Bearer ...` value as the Azure key
+- if `ALLOWED_ORIGINS` is set, only those browser origins receive CORS access; non-browser clients are unaffected
 
 ## MODEL_MAPPING Format
 
@@ -214,6 +218,8 @@ AZURE_OAI_ENDPOINT      = "https://your-resource.cognitiveservices.azure.com"
 AZURE_INFER_ENDPOINT    = "https://your-project.services.ai.azure.com"
 AZURE_OAI_API_VERSION   = "2025-04-01-preview"
 AZURE_INFER_API_VERSION = "2024-05-01-preview"
+ALLOWED_ORIGINS         = "https://chat.example.com"
+UPSTREAM_TIMEOUT_MS     = "30000"
 ```
 
 Use secrets for sensitive values:
@@ -246,8 +252,9 @@ Clients that support the newer Responses API can use the same base URL; the prox
 - manual deployment and Wrangler deployment behave the same after release; the main difference is how you publish updates
 - `GET /v1/models` reflects the configured mapping, not Azure auto-discovery
 - a model only works if the corresponding endpoint and deployment are actually configured in Azure
+- the proxy now forwards only a small whitelist of safe response headers instead of exposing Azure-specific `x-ms-*` or `apim-*` headers as-is
 - this project intentionally stays small: it does not implement retries, caching, quotas, auditing, or multi-tenant management
-- the repository also ships a Docker image, mainly for running `wrangler dev --local`; it is not required for Cloudflare production deployment
+- the repository also ships a Docker image, but it runs `wrangler dev --local` and is meant for local debugging rather than production deployment
 
 ## Main Files
 
