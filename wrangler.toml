@@ -14,7 +14,7 @@ AZURE_INFER_ENDPOINT    = "https://waytoagi.services.ai.azure.com"
 AZURE_OAI_API_VERSION   = "2025-04-01-preview"
 AZURE_INFER_API_VERSION = "2024-05-01-preview"
 # ALLOWED_ORIGINS       = "https://chat.example.com"
-# UPSTREAM_TIMEOUT_MS   = "30000"
+# UPSTREAM_TIMEOUT_MS   = "120000"
 
 # Secrets — set via CLI, never commit them:
 #
