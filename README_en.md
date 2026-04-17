@@ -95,7 +95,7 @@ Configure these in Cloudflare Workers Variables / Secrets:
 | `ALLOWED_ORIGINS` | No | Comma-separated browser origins allowed by CORS, for example `https://chat.example.com` |
 | `AZURE_OAI_API_VERSION` | No | Defaults to `2025-04-01-preview` |
 | `AZURE_INFER_API_VERSION` | No | Defaults to `2024-05-01-preview` |
-| `UPSTREAM_TIMEOUT_MS` | No | Timeout for Azure upstream requests, defaults to `30000` |
+| `UPSTREAM_TIMEOUT_MS` | No | Timeout for Azure upstream requests in milliseconds, defaults to `120000`. Bounds time-to-first-byte only — streaming bodies are not cut off once they start |
 | `MODEL_MAPPING` | No | JSON string; falls back to the built-in default mapping |
 
 Notes:
@@ -219,7 +219,7 @@ AZURE_INFER_ENDPOINT    = "https://your-project.services.ai.azure.com"
 AZURE_OAI_API_VERSION   = "2025-04-01-preview"
 AZURE_INFER_API_VERSION = "2024-05-01-preview"
 ALLOWED_ORIGINS         = "https://chat.example.com"
-UPSTREAM_TIMEOUT_MS     = "30000"
+UPSTREAM_TIMEOUT_MS     = "120000"
 ```
 
 Use secrets for sensitive values:

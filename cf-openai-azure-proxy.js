@@ -17,9 +17,10 @@
 
 const DEFAULT_OAI_API_VERSION = "2025-04-01-preview";
 const DEFAULT_INFER_API_VERSION = "2024-05-01-preview";
-const DEFAULT_UPSTREAM_TIMEOUT_MS = 30000;
-const DEFAULT_CORS_ALLOW_HEADERS = "Authorization, Content-Type";
-const DEFAULT_CORS_EXPOSE_HEADERS = "openai-processing-ms, x-request-id";
+// Default governs time-to-first-byte. 120s accommodates reasoning models (o1,
+// gpt-5.x) whose non-streaming TTFB routinely exceeds 30s.
+const DEFAULT_UPSTREAM_TIMEOUT_MS = 120000;
+const DEFAULT_CORS_ALLOW_HEADERS = "Authorization, Content-Type, api-key";
 const SAFE_RESPONSE_HEADERS = new Set([
   "cache-control",
   "content-disposition",
@@ -28,8 +29,30 @@ const SAFE_RESPONSE_HEADERS = new Set([
   "content-type",
   "openai-processing-ms",
   "retry-after",
+  "x-ratelimit-limit-requests",
+  "x-ratelimit-limit-tokens",
+  "x-ratelimit-remaining-requests",
+  "x-ratelimit-remaining-tokens",
+  "x-ratelimit-reset-requests",
+  "x-ratelimit-reset-tokens",
   "x-request-id"
 ]);
+// Expose to browser JS every safe header that isn't required by default (CORS
+// already exposes Cache-Control, Content-Language, Content-Type, Expires,
+// Last-Modified, Pragma).
+const DEFAULT_CORS_EXPOSE_HEADERS = [
+  "content-disposition",
+  "content-encoding",
+  "openai-processing-ms",
+  "retry-after",
+  "x-ratelimit-limit-requests",
+  "x-ratelimit-limit-tokens",
+  "x-ratelimit-remaining-requests",
+  "x-ratelimit-remaining-tokens",
+  "x-ratelimit-reset-requests",
+  "x-ratelimit-reset-tokens",
+  "x-request-id"
+].join(", ");
 const TEXT_ENCODER = new TextEncoder();
 
 let cachedModelMappingRaw = null;

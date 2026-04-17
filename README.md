@@ -98,7 +98,7 @@ OpenAI-compatible client
 | `ALLOWED_ORIGINS` | 否 | 逗号分隔，仅允许这些浏览器来源通过 CORS 访问，例如 `https://chat.example.com` |
 | `AZURE_OAI_API_VERSION` | 否 | 默认 `2025-04-01-preview` |
 | `AZURE_INFER_API_VERSION` | 否 | 默认 `2024-05-01-preview` |
-| `UPSTREAM_TIMEOUT_MS` | 否 | 上游 Azure 请求超时，默认 `30000` |
+| `UPSTREAM_TIMEOUT_MS` | 否 | 上游 Azure 请求超时（毫秒），默认 `120000`。控制的是等待首字节的时间，流式返回开始后不受此限 |
 | `MODEL_MAPPING` | 否 | JSON 字符串；不填时使用代码内置默认映射 |
 
 说明：
@@ -222,7 +222,7 @@ AZURE_INFER_ENDPOINT    = "https://your-project.services.ai.azure.com"
 AZURE_OAI_API_VERSION   = "2025-04-01-preview"
 AZURE_INFER_API_VERSION = "2024-05-01-preview"
 ALLOWED_ORIGINS         = "https://chat.example.com"
-UPSTREAM_TIMEOUT_MS     = "30000"
+UPSTREAM_TIMEOUT_MS     = "120000"
 ```
 
 敏感信息使用 secret：
