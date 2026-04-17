@@ -138,16 +138,73 @@ Rules:
 
 ## Deployment
 
-The recommended deployment path is Cloudflare Workers with Wrangler.
+The recommended starting point is manual deployment in the Cloudflare Dashboard because it is the most obvious path for first-time setup. `Wrangler` is optional and is better for repeat updates, versioned config, and local development.
 
-### 1. Install and log in
+### Option 1: Manual Deployment in the Cloudflare Dashboard
+
+#### 1. Create a Worker
+
+- Sign in to the Cloudflare Dashboard
+- Open Workers & Pages
+- Create a new Worker
+
+#### 2. Paste the script
+
+Copy the full contents of [cf-openai-azure-proxy.js](./cf-openai-azure-proxy.js) into the Cloudflare Worker editor and replace the default sample code.
+
+#### 3. Configure Variables and Secrets
+
+In the Worker Settings / Variables page, add:
+
+- regular variables for non-sensitive values
+  - `AZURE_OAI_ENDPOINT`
+  - `AZURE_INFER_ENDPOINT`
+  - `AZURE_OAI_API_VERSION`
+  - `AZURE_INFER_API_VERSION`
+- secrets for sensitive values
+  - `AZURE_API_KEY`
+  - `CLIENT_API_KEYS`
+  - `MODEL_MAPPING`
+
+You can start with the minimum required set:
+
+- `AZURE_API_KEY`
+- `AZURE_OAI_ENDPOINT` or `AZURE_INFER_ENDPOINT`
+- `CLIENT_API_KEYS` (recommended)
+
+Add `MODEL_MAPPING` only if you want to override the built-in mapping.
+
+#### 4. Deploy and use the Worker URL
+
+Save and deploy the Worker. Cloudflare will give you a Worker URL.
+
+Use this as the base URL in your OpenAI-compatible client:
+
+```text
+https://your-worker.your-subdomain.workers.dev/v1
+```
+
+If you have your own domain, you can also bind a custom domain or route in the Worker settings and use `https://your-domain/v1` instead.
+
+### Option 2: Deploy with Wrangler CLI
+
+`Wrangler` is not required. It simply turns the "paste code in the dashboard, fill in variables, click deploy" flow into a CLI workflow that is easier to repeat.
+
+In this repository:
+
+- [wrangler.toml](./wrangler.toml) sets the entrypoint with `main = "cf-openai-azure-proxy.js"`
+- `wrangler deploy` uploads [cf-openai-azure-proxy.js](./cf-openai-azure-proxy.js) as the Worker
+- non-secret values from `[vars]` are included automatically
+- sensitive values such as `AZURE_API_KEY`, `CLIENT_API_KEYS`, and `MODEL_MAPPING` should still be stored as secrets
+
+#### 1. Install and log in
 
 ```bash
 npm i -g wrangler
 wrangler login
 ```
 
-### 2. Configure variables
+#### 2. Configure variables
 
 Use `[vars]` in `wrangler.toml` for non-secret values, for example:
 
@@ -167,7 +224,7 @@ wrangler secret put CLIENT_API_KEYS
 wrangler secret put MODEL_MAPPING
 ```
 
-### 3. Deploy
+#### 3. Deploy
 
 ```bash
 wrangler deploy
@@ -186,10 +243,11 @@ Clients that support the newer Responses API can use the same base URL; the prox
 
 ## Notes
 
+- manual deployment and Wrangler deployment behave the same after release; the main difference is how you publish updates
 - `GET /v1/models` reflects the configured mapping, not Azure auto-discovery
 - a model only works if the corresponding endpoint and deployment are actually configured in Azure
 - this project intentionally stays small: it does not implement retries, caching, quotas, auditing, or multi-tenant management
-- the repository also ships a Docker image, mainly for running `wrangler dev --local`; for actual Cloudflare deployment, Wrangler is still the recommended path
+- the repository also ships a Docker image, mainly for running `wrangler dev --local`; it is not required for Cloudflare production deployment
 
 ## Main Files
 

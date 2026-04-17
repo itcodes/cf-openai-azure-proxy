@@ -1,0 +1,52 @@
+name: Validate
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Check worker syntax
+        run: node --check --experimental-default-type=module cf-openai-azure-proxy.js
+
+      - name: Check entrypoint shell syntax
+        run: sh -n docker-entrypoint.sh
+
+      - name: Validate local README links
+        run: |
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          root = Path(".").resolve()
+          readmes = [root / "README.md", root / "README_en.md"]
+          missing = []
+
+          pattern = re.compile(r"\]\((\./[^)#]+)")
+
+          for readme in readmes:
+            text = readme.read_text(encoding="utf-8")
+            for match in pattern.finditer(text):
+              rel = match.group(1)
+              target = (readme.parent / rel).resolve()
+              if not target.exists():
+                missing.append(f"{readme.name}: missing {rel}")
+
+          if missing:
+            raise SystemExit("\n".join(missing))
+
+          print("All local README links resolve.")
+          PY

@@ -141,16 +141,73 @@ OpenAI-compatible client
 
 ## 部署方式
 
-当前推荐方式是直接用 Wrangler 部署 Cloudflare Worker。
+推荐先走 Cloudflare Dashboard 手动部署，第一次上手最直观；`Wrangler` 更适合后续更新、版本化配置和本地调试。
 
-### 1. 准备项目
+### 方式一：Cloudflare Dashboard 手动部署（推荐）
+
+#### 1. 创建 Worker
+
+- 登录 Cloudflare Dashboard
+- 进入 Workers & Pages
+- 新建一个 Worker
+
+#### 2. 复制脚本
+
+把仓库里的 [cf-openai-azure-proxy.js](./cf-openai-azure-proxy.js) 全部复制到 Cloudflare Worker 编辑器中，覆盖默认示例代码。
+
+#### 3. 配置 Variables 和 Secrets
+
+在 Worker 的 Settings / Variables 中配置这些值：
+
+- 非敏感变量可直接添加为普通变量
+  - `AZURE_OAI_ENDPOINT`
+  - `AZURE_INFER_ENDPOINT`
+  - `AZURE_OAI_API_VERSION`
+  - `AZURE_INFER_API_VERSION`
+- 敏感变量建议添加为 secret
+  - `AZURE_API_KEY`
+  - `CLIENT_API_KEYS`
+  - `MODEL_MAPPING`
+
+可以先只配最小必需项：
+
+- `AZURE_API_KEY`
+- `AZURE_OAI_ENDPOINT` 或 `AZURE_INFER_ENDPOINT`
+- `CLIENT_API_KEYS`（建议）
+
+如果你想自定义模型映射，再额外配置 `MODEL_MAPPING`。
+
+#### 4. 部署并拿到地址
+
+保存并部署后，Cloudflare 会给你一个 Worker URL。
+
+把下面这个地址填到你的 OpenAI 兼容客户端里：
+
+```text
+https://your-worker.your-subdomain.workers.dev/v1
+```
+
+如果你有自己的域名，也可以在 Worker 的域名 / 路由设置里绑定自定义域名，再把 `https://your-domain/v1` 配给客户端。
+
+### 方式二：Wrangler CLI 部署（可选）
+
+`Wrangler` 不是必须的。它的作用是把“在网页里复制代码、手动填变量、点击发布”的流程改成命令行方式，更适合反复更新。
+
+这个仓库里：
+
+- [wrangler.toml](./wrangler.toml) 指定了入口文件 `main = "cf-openai-azure-proxy.js"`
+- 执行 `wrangler deploy` 时，会把 [cf-openai-azure-proxy.js](./cf-openai-azure-proxy.js) 上传成 Worker
+- `[vars]` 中的非敏感变量会一并带上
+- `AZURE_API_KEY`、`CLIENT_API_KEYS`、`MODEL_MAPPING` 这类敏感值仍建议用 secret
+
+#### 1. 安装并登录
 
 ```bash
 npm i -g wrangler
 wrangler login
 ```
 
-### 2. 配置变量
+#### 2. 配置变量
 
 `wrangler.toml` 中的 `[vars]` 可放非敏感配置，例如：
 
@@ -170,13 +227,13 @@ wrangler secret put CLIENT_API_KEYS
 wrangler secret put MODEL_MAPPING
 ```
 
-### 3. 部署
+#### 3. 部署
 
 ```bash
 wrangler deploy
 ```
 
-部署完成后，会拿到一个 Worker URL。把 `{WORKER_URL}/v1` 配到你的 OpenAI 兼容客户端即可。
+部署完成后，同样把 `{WORKER_URL}/v1` 配到你的 OpenAI 兼容客户端即可。
 
 ## 客户端怎么填
 
@@ -189,10 +246,11 @@ wrangler deploy
 
 ## 注意事项
 
+- 手动部署和 Wrangler 部署的运行效果是一样的，区别主要在发布方式
 - `GET /v1/models` 返回的是映射表里的模型列表，不是 Azure 自动探测结果
 - 只有配置了相应 endpoint 和 deployment 的模型才能真正调用成功
 - 本项目默认只做协议转换和透传，不做重试、缓存、配额、审计或多租户管理
-- 仓库也提供 Docker 镜像，主要用于本地运行 `wrangler dev --local`；部署到 Cloudflare 仍推荐直接使用 Wrangler
+- 仓库也提供 Docker 镜像，主要用于本地运行 `wrangler dev --local`，不是 Cloudflare 线上部署的必需项
 
 ## 主要文件
 
