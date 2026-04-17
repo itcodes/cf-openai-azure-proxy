@@ -95,15 +95,19 @@ OpenAI-compatible client
 | `AZURE_OAI_ENDPOINT` | 使用 Azure OpenAI 时必填 | 例如 `https://your-resource.cognitiveservices.azure.com` |
 | `AZURE_INFER_ENDPOINT` | 使用 Azure AI Model Inference 时必填 | 例如 `https://your-project.services.ai.azure.com` |
 | `CLIENT_API_KEYS` | 推荐 | 逗号分隔，作为客户端访问你这个代理时使用的 key |
+| `ALLOWED_ORIGINS` | 否 | 逗号分隔，仅允许这些浏览器来源通过 CORS 访问，例如 `https://chat.example.com` |
 | `AZURE_OAI_API_VERSION` | 否 | 默认 `2025-04-01-preview` |
 | `AZURE_INFER_API_VERSION` | 否 | 默认 `2024-05-01-preview` |
+| `UPSTREAM_TIMEOUT_MS` | 否 | 上游 Azure 请求超时，默认 `30000` |
 | `MODEL_MAPPING` | 否 | JSON 字符串；不填时使用代码内置默认映射 |
 
 说明：
 
 - 如果设置了 `CLIENT_API_KEYS`，客户端必须用其中某个 key 访问 Worker
+- 如果设置了 `CLIENT_API_KEYS`，也必须同时设置 `AZURE_API_KEY`，避免把客户端 key 错发给 Azure 上游
 - 如果没有设置 `CLIENT_API_KEYS`，Worker 会放行客户端请求
-- 如果同时也没有设置 `AZURE_API_KEY`，则会尝试把客户端 `Authorization: Bearer ...` 当作 Azure key 继续透传
+- 如果没有设置 `CLIENT_API_KEYS` 且也没有设置 `AZURE_API_KEY`，则会尝试把客户端 `Authorization: Bearer ...` 当作 Azure key 继续透传
+- 如果设置了 `ALLOWED_ORIGINS`，只有这些 Origin 的浏览器请求会拿到 CORS 许可；非浏览器客户端不受影响
 
 ## MODEL_MAPPING 格式
 
@@ -217,6 +221,8 @@ AZURE_OAI_ENDPOINT      = "https://your-resource.cognitiveservices.azure.com"
 AZURE_INFER_ENDPOINT    = "https://your-project.services.ai.azure.com"
 AZURE_OAI_API_VERSION   = "2025-04-01-preview"
 AZURE_INFER_API_VERSION = "2024-05-01-preview"
+ALLOWED_ORIGINS         = "https://chat.example.com"
+UPSTREAM_TIMEOUT_MS     = "30000"
 ```
 
 敏感信息使用 secret：
@@ -249,8 +255,9 @@ wrangler deploy
 - 手动部署和 Wrangler 部署的运行效果是一样的，区别主要在发布方式
 - `GET /v1/models` 返回的是映射表里的模型列表，不是 Azure 自动探测结果
 - 只有配置了相应 endpoint 和 deployment 的模型才能真正调用成功
+- 代理默认只透传一小部分安全响应头，不会把 Azure 的 `x-ms-*`、`apim-*` 等内部头原样暴露给客户端
 - 本项目默认只做协议转换和透传，不做重试、缓存、配额、审计或多租户管理
-- 仓库也提供 Docker 镜像，主要用于本地运行 `wrangler dev --local`，不是 Cloudflare 线上部署的必需项
+- 仓库也提供 Docker 镜像，但它运行的是 `wrangler dev --local`，定位是本地调试，不建议当生产部署方式使用
 
 ## 主要文件
 
