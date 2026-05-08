@@ -44,6 +44,8 @@
 默认映射里已经给了这些示例：
 
 - GPT 系列
+  - `gpt-chat-latest`
+  - `gpt-5.5`
   - `gpt-5.4`
   - `gpt-4o`
   - `gpt-4o-mini`
@@ -117,6 +119,14 @@ OpenAI-compatible client
 
 ```json
 {
+  "gpt-chat-latest": {
+    "backend": "oai",
+    "deployment": "gpt-5.5"
+  },
+  "gpt-5.5": {
+    "backend": "oai",
+    "deployment": "gpt-5.5"
+  },
   "gpt-5.4": {
     "backend": "oai",
     "deployment": "gpt-5.4"

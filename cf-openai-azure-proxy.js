@@ -61,6 +61,8 @@ let cachedModelMapping = null;
 const DEFAULT_MAPPING = {
   // OpenAI-family on yoyo (classic + responses share the same entry;
   // the proxy picks the upstream path based on which client path was hit)
+  "gpt-chat-latest":       { backend: "oai",   deployment: "gpt-5.5" },
+  "gpt-5.5":               { backend: "oai",   deployment: "gpt-5.5" },
   "gpt-5.4":               { backend: "oai",   deployment: "gpt-5.4" },
   "gpt-4o":                { backend: "oai",   deployment: "gpt-4o" },
   "gpt-4o-mini":           { backend: "oai",   deployment: "gpt-4o-mini" },

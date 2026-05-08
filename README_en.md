@@ -43,6 +43,8 @@ This is a stateless proxy. It is not a chatbot app, billing system, admin panel,
 The built-in default mapping includes examples for:
 
 - GPT family
+  - `gpt-chat-latest`
+  - `gpt-5.5`
   - `gpt-5.4`
   - `gpt-4o`
   - `gpt-4o-mini`
@@ -114,6 +116,14 @@ Example:
 
 ```json
 {
+  "gpt-chat-latest": {
+    "backend": "oai",
+    "deployment": "gpt-5.5"
+  },
+  "gpt-5.5": {
+    "backend": "oai",
+    "deployment": "gpt-5.5"
+  },
   "gpt-5.4": {
     "backend": "oai",
     "deployment": "gpt-5.4"

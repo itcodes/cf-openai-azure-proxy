@@ -24,6 +24,8 @@ AZURE_INFER_API_VERSION = "2024-05-01-preview"
 #
 # Example MODEL_MAPPING JSON (paste as a single line when running the command):
 # {
+#   "gpt-chat-latest":       {"backend":"oai",   "deployment":"gpt-5.5"},
+#   "gpt-5.5":               {"backend":"oai",   "deployment":"gpt-5.5"},
 #   "gpt-5.4":               {"backend":"oai",   "deployment":"gpt-5.4"},
 #   "gpt-4o":                {"backend":"oai",   "deployment":"gpt-4o"},
 #   "gpt-4o-mini":           {"backend":"oai",   "deployment":"gpt-4o-mini"},
