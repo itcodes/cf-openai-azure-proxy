@@ -49,11 +49,13 @@ OpenAI-compatible client
      - 其他（grok、deepseek、llama 等）                                -> 先打 *.services.ai.azure.com
      - 同类资源之间、以及无法识别的域名，按 AZURE_ENDPOINTS 里的顺序
   -> POST {endpoint}/openai/v1/{path}，model = deployment 名
-  -> 如果该资源返回 404 / 未知模型，依次换下一个资源重试
+  -> 如果该资源返回 404 / 未知模型，或者 429 限流 / 5xx 故障，依次换下一个资源重试
   -> 把响应原样返回给客户端
 ```
 
 成功的资源会在 Worker 实例内记住，所以回退只在第一次多一次往返。
+
+每个请求会在 Worker 日志里记一行 JSON（模型、使用的资源、各资源返回的状态码、耗时、是哪个客户端 key），不记录对话内容和任何 key。用 `npx wrangler@4 tail <worker 名>` 查看。
 
 ## 环境变量
 
@@ -206,14 +208,13 @@ wrangler deploy
 - `GET /v1/models` 返回的是 `MODEL_MAPPING` 的 key 加上 `MODEL_LIST`，不是 Azure 自动探测结果（列出 deployment 需要 Azure 管理凭据，API key 做不到）。不在列表里的模型照样能调用
 - 只有在 Azure 中实际部署了的模型才能调用成功
 - 代理默认只透传一小部分安全响应头，不会把 Azure 的 `x-ms-*`、`apim-*` 等内部头原样暴露给客户端
-- 本项目默认只做协议转换和透传，除上面的资源回退外，不做重试、缓存、配额、审计或多租户管理
-- 仓库也提供 Docker 镜像，但它运行的是 `wrangler dev --local`，定位是本地调试，不建议当生产部署方式使用
+- 本项目默认只做协议转换和透传，除了在资源之间切换（找不到 deployment、429 限流、5xx 故障时换下一个资源），不做重试、缓存、配额、审计或多租户管理
+- 仓库里的 `Dockerfile` 可以在本地构建镜像（`docker build -t cf-openai-azure-proxy .`），运行的是 `wrangler dev --local`，只用于本地调试，不建议当生产部署方式使用
 
 ## 主要文件
 
 - [cf-openai-azure-proxy.js](./cf-openai-azure-proxy.js): 当前主 Worker 实现
 - [wrangler.toml](./wrangler.toml): Worker 配置
-- [cf-openai-palm-proxy.js](./cf-openai-palm-proxy.js): 早期 PaLM 代理脚本，和当前 Azure 主实现无关
 
 ## License
 

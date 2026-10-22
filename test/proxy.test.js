@@ -13,9 +13,12 @@ const ENV = {
 
 let calls;
 let responder;
+let logs;
 
 beforeEach(() => {
   calls = [];
+  logs = [];
+  console.log = (line) => logs.push(JSON.parse(line));
   responder = () => Response.json({ ok: true });
   globalThis.fetch = async (url, init) => {
     const call = { url, init, body: init.body };
@@ -219,4 +222,74 @@ test("invalid endpoint URL is a config error", async () => {
   const resp = await worker.fetch(post("/v1/chat/completions", { model: "gpt-9" }), { AZURE_API_KEY: "k", AZURE_ENDPOINTS: "not a url" });
   assert.equal(resp.status, 500);
   assert.match((await resp.json()).error.message, /Invalid Azure endpoint URL/);
+});
+
+const hostsOf = () => calls.map((c) => c.url.split("/openai")[0]);
+const notFound = () => Response.json({ error: { code: "DeploymentNotFound" } }, { status: 404 });
+
+test("429 on one resource fails over to the next", async () => {
+  responder = ({ url }) => url.startsWith(OAI)
+    ? Response.json({ error: { code: "429" } }, { status: 429, headers: { "retry-after": "5" } })
+    : Response.json({ ok: true });
+  const resp = await worker.fetch(post("/v1/responses", { model: "gpt-busy-1", input: "hi" }), ENV);
+  assert.equal(resp.status, 200);
+  assert.deepEqual(hostsOf(), [OAI, INFER]);
+});
+
+test("5xx followed by a missing deployment returns the 5xx, not the 404", async () => {
+  responder = ({ url }) => url.startsWith(OAI)
+    ? Response.json({ error: { code: "ServiceUnavailable" } }, { status: 503 })
+    : notFound();
+  const resp = await worker.fetch(post("/v1/chat/completions", { model: "gpt-busy-2" }), ENV);
+  assert.equal(resp.status, 503);
+  assert.equal((await resp.json()).error.code, "ServiceUnavailable");
+});
+
+test("429 with a single resource is returned as-is", async () => {
+  responder = () => Response.json({ error: { code: "429" } }, { status: 429, headers: { "retry-after": "7" } });
+  const resp = await worker.fetch(post("/v1/chat/completions", { model: "gpt-busy-3" }), { ...ENV, AZURE_INFER_ENDPOINT: "" });
+  assert.equal(resp.status, 429);
+  assert.equal(resp.headers.get("retry-after"), "7");
+  assert.equal(calls.length, 1);
+});
+
+test("network error on one resource fails over to the next", async () => {
+  responder = ({ url }) => {
+    if (url.startsWith(OAI)) throw new TypeError("fetch failed");
+    return Response.json({ ok: true });
+  };
+  const resp = await worker.fetch(post("/v1/chat/completions", { model: "gpt-busy-4" }), ENV);
+  assert.equal(resp.status, 200);
+  assert.deepEqual(logs.at(-1).attempts, ["oai.example.com:network_error", "infer.example.com:200"]);
+});
+
+test("a rate-limited resource is not remembered as the working one", async () => {
+  responder = ({ url }) => url.startsWith(OAI) ? new Response("busy", { status: 429 }) : Response.json({ ok: true });
+  await worker.fetch(post("/v1/chat/completions", { model: "gpt-busy-5" }), ENV);
+  calls = [];
+  responder = () => Response.json({ ok: true });
+  await worker.fetch(post("/v1/chat/completions", { model: "gpt-busy-5" }), ENV);
+  assert.deepEqual(hostsOf(), [INFER]);
+});
+
+test("each upstream request logs one line without keys or content", async () => {
+  responder = ({ url }) => url.startsWith(OAI) ? notFound() : Response.json({ ok: true });
+  const env = { ...ENV, CLIENT_API_KEYS: "sk-other,sk-test" };
+  await worker.fetch(post("/v1/chat/completions", { model: "gpt-log-1", messages: [{ role: "user", content: "secret prompt" }] }), env);
+  assert.equal(logs.length, 1);
+  const line = logs[0];
+  assert.equal(line.path, "/chat/completions");
+  assert.equal(line.model, "gpt-log-1");
+  assert.equal(line.client, "key#2");
+  assert.equal(line.status, 200);
+  assert.equal(line.endpoint, "infer.example.com");
+  assert.deepEqual(line.attempts, ["oai.example.com:404", "infer.example.com:200"]);
+  assert.equal(typeof line.ttfb_ms, "number");
+  const raw = JSON.stringify(line);
+  assert.ok(!raw.includes("sk-test") && !raw.includes("azure-key") && !raw.includes("secret prompt"));
+});
+
+test("rejected client keys are logged", async () => {
+  await worker.fetch(post("/v1/chat/completions", { model: "gpt-9" }, { Authorization: "Bearer wrong" }), ENV);
+  assert.deepEqual(logs, [{ path: "/chat/completions", status: 401, error: "invalid_client_key" }]);
 });

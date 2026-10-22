@@ -46,11 +46,13 @@ OpenAI-compatible client
      - everything else (grok, deepseek, llama, ...)                  -> *.services.ai.azure.com first
      - ties and unrecognized hosts keep their AZURE_ENDPOINTS order
   -> POST {endpoint}/openai/v1/{path} with model = deployment name
-  -> if that resource answers 404 / unknown model, retry on the next one
+  -> if that resource answers 404 / unknown model, 429 or 5xx, retry on the next one
   -> return the upstream response as-is
 ```
 
 The resource that worked is remembered per Worker instance, so a fallback only costs an extra round trip the first time.
+
+Each request logs one JSON line to the Worker logs (model, resource used, status from each resource tried, latency, which client key) with no prompt/response content and no keys. View them with `npx wrangler@4 tail <worker-name>`.
 
 ## Environment Variables
 
@@ -203,14 +205,13 @@ Clients that support the newer Responses API can use the same base URL; the prox
 - `GET /v1/models` returns `MODEL_MAPPING` keys plus `MODEL_LIST`, not Azure auto-discovery (listing deployments needs Azure management credentials, not an API key). Models missing from the list still work
 - a model only works if the corresponding endpoint and deployment are actually configured in Azure
 - the proxy now forwards only a small whitelist of safe response headers instead of exposing Azure-specific `x-ms-*` or `apim-*` headers as-is
-- this project intentionally stays small: apart from the resource fallback above, it does not implement retries, caching, quotas, auditing, or multi-tenant management
-- the repository also ships a Docker image, but it runs `wrangler dev --local` and is meant for local debugging rather than production deployment
+- this project intentionally stays small: apart from switching resources (missing deployment, 429 rate limit, 5xx), it does not implement retries, caching, quotas, auditing, or multi-tenant management
+- the `Dockerfile` can build a local image (`docker build -t cf-openai-azure-proxy .`); it runs `wrangler dev --local` and is meant for local debugging rather than production deployment
 
 ## Main Files
 
 - [cf-openai-azure-proxy.js](./cf-openai-azure-proxy.js): current Worker implementation
 - [wrangler.toml](./wrangler.toml): Worker configuration
-- [cf-openai-palm-proxy.js](./cf-openai-palm-proxy.js): older PaLM proxy script, unrelated to the current Azure-focused implementation
 
 ## License
 

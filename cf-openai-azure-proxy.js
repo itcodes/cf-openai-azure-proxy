@@ -3,9 +3,10 @@
 //   {endpoint}/openai/v1/{path}   (deployment name in body.model, no api-version)
 // Any number of Azure resources can be configured. The model name picks which
 // kind of resource is tried first (Azure OpenAI vs. AI Foundry); if a resource
-// doesn't have the deployment, the request is retried on the next one. Model
-// names are passed through as deployment names, so new deployments work without
-// code changes.
+// doesn't have the deployment, is rate-limited (429) or fails (5xx), the request
+// is retried on the next one. Model names are passed through as deployment
+// names, so new deployments work without code changes. Each upstream request
+// logs one JSON line (no prompt or response content) for `wrangler tail`.
 //
 // Env vars (set in Workers dashboard -> Settings -> Variables):
 //   AZURE_ENDPOINTS          comma/newline-separated resources, each `url` or `url|key`, e.g.
@@ -116,7 +117,10 @@ export default {
 
       // Client auth
       const authErr = checkClientAuth(request, cfg);
-      if (authErr) return authErr;
+      if (authErr) {
+        logRequest({ path, status: 401, error: "invalid_client_key" });
+        return authErr;
+      }
 
       // Routes that don't need model lookup
       if (path === "/models" && request.method === "GET") {
@@ -289,10 +293,24 @@ function checkClientAuth(request, cfg) {
 }
 
 function hasMatchingClientKey(key, clientKeys) {
-  for (const candidate of clientKeys) {
-    if (timingSafeEqual(key, candidate)) return true;
-  }
-  return false;
+  return matchClientKey(key, clientKeys) >= 0;
+}
+
+function matchClientKey(key, clientKeys) {
+  let match = -1;
+  clientKeys.forEach((candidate, i) => {
+    if (timingSafeEqual(key, candidate) && match < 0) match = i;
+  });
+  return match;
+}
+
+// Which CLIENT_API_KEYS entry made the request, as "key#1", "key#2", ... so logs
+// can tell clients apart without recording the key itself.
+function clientKeyLabel(request, cfg) {
+  if (cfg.clientKeys.length === 0) return null;
+  const auth = request.headers.get("Authorization") || "";
+  const i = matchClientKey(auth.replace(/^Bearer\s+/i, "").trim(), cfg.clientKeys);
+  return i >= 0 ? `key#${i + 1}` : null;
 }
 
 function timingSafeEqual(a, b) {
@@ -332,7 +350,7 @@ function resolveModel(modelName, cfg) {
     .map((e, i) => ({ e, i }))
     .sort((a, b) => rank(a.e) - rank(b.e) || a.i - b.i)
     .map(({ e }) => e);
-  return { deployment, endpoints };
+  return { model: modelName, deployment, endpoints };
 }
 
 async function proxyToAzure(request, cfg, path, target, body, extraHeaders = {}) {
@@ -340,8 +358,33 @@ async function proxyToAzure(request, cfg, path, target, body, extraHeaders = {})
     return errorResponse(500, "proxy_error", "No Azure endpoint configured (set AZURE_ENDPOINTS)", request, cfg);
   }
 
+  const started = Date.now();
+  const attempts = [];
+  const log = (status, extra = {}) => logRequest({
+    path,
+    model: target.model,
+    deployment: target.deployment,
+    client: clientKeyLabel(request, cfg),
+    status,
+    attempts,
+    ttfb_ms: Date.now() - started,
+    ...extra
+  });
+  const send = (resp, endpoint) => {
+    if (resp.ok) endpointCache.set(target.deployment, endpoint.url);
+    log(resp.status, { endpoint: hostOf(endpoint.url) });
+    return new Response(resp.body, {
+      status: resp.status,
+      headers: buildClientResponseHeaders(resp.headers, request, cfg)
+    });
+  };
+  // First rate-limit / server error seen. If every later endpoint just lacks
+  // the deployment, this is the more useful error to hand back.
+  let held = null;
+
   for (let i = 0; i < target.endpoints.length; i += 1) {
     const endpoint = target.endpoints[i];
+    const isLast = i === target.endpoints.length - 1;
     const azureKey = resolveAzureKey(request, cfg, endpoint);
     if (!azureKey) {
       return errorResponse(500, "proxy_error", "No Azure API key available (set AZURE_API_KEY or send Authorization header)", request, cfg);
@@ -352,6 +395,8 @@ async function proxyToAzure(request, cfg, path, target, body, extraHeaders = {})
       resp = await fetchUpstream(cfg, `${endpoint.url}/openai/v1${path}`, azureKey, body, extraHeaders);
     } catch (e) {
       if (e && e.name === "AbortError") {
+        attempts.push(`${hostOf(endpoint.url)}:timeout`);
+        log(504);
         return errorResponse(
           504,
           "upstream_timeout",
@@ -360,28 +405,49 @@ async function proxyToAzure(request, cfg, path, target, body, extraHeaders = {})
           cfg
         );
       }
+      attempts.push(`${hostOf(endpoint.url)}:network_error`);
+      if (!isLast) continue;
+      if (held) return send(held.resp, held.endpoint);
+      log(502, { error: String(e && e.message || e) });
       throw e;
     }
+    attempts.push(`${hostOf(endpoint.url)}:${resp.status}`);
 
-    const isLast = i === target.endpoints.length - 1;
-    if (!isLast && await isDeploymentMissing(resp)) {
-      if (resp.body) await resp.body.cancel();
+    const outcome = await classifyUpstream(resp);
+    if (outcome === "retry" && !isLast) {
+      if (held) {
+        if (resp.body) await resp.body.cancel();
+      } else {
+        held = { resp: new Response(await resp.arrayBuffer(), resp), endpoint };
+      }
       continue;
     }
-    if (resp.ok) endpointCache.set(target.deployment, endpoint.url);
-
-    return new Response(resp.body, {
-      status: resp.status,
-      headers: buildClientResponseHeaders(resp.headers, request, cfg)
-    });
+    if (outcome === "missing" && (held || !isLast)) {
+      if (resp.body) await resp.body.cancel();
+      if (!isLast) continue;
+      return send(held.resp, held.endpoint);
+    }
+    return send(resp, endpoint);
   }
 }
 
-async function isDeploymentMissing(resp) {
-  if (resp.status === 404) return true;
-  if (resp.status !== 400) return false;
+// "missing": this resource doesn't have the deployment -> try the next one.
+// "retry": rate-limited or Azure-side failure -> try the next one.
+// "final": success or a client error that another resource won't fix.
+async function classifyUpstream(resp) {
+  if (resp.status === 429 || resp.status >= 500) return "retry";
+  if (resp.status === 404) return "missing";
+  if (resp.status !== 400) return "final";
   const text = await resp.clone().text().catch(() => "");
-  return /DeploymentNotFound|unknown_model|model_not_found|unknown model/i.test(text);
+  return /DeploymentNotFound|unknown_model|model_not_found|unknown model/i.test(text) ? "missing" : "final";
+}
+
+function hostOf(url) {
+  return new URL(url).host;
+}
+
+function logRequest(fields) {
+  console.log(JSON.stringify(fields));
 }
 
 async function fetchUpstream(cfg, upstreamUrl, azureKey, body, extraHeaders) {

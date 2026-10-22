@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A stateless Cloudflare Worker that accepts OpenAI-style `/v1/*` requests and forwards them to Azure OpenAI / Azure AI Foundry. The whole implementation is one file, `cf-openai-azure-proxy.js`, with no dependencies and no build step. `cf-openai-palm-proxy.js` is a legacy PaLM script unrelated to the main proxy; leave it alone unless asked.
+A stateless Cloudflare Worker that accepts OpenAI-style `/v1/*` requests and forwards them to Azure OpenAI / Azure AI Foundry. The whole implementation is one file, `cf-openai-azure-proxy.js`, with no dependencies and no build step.
 
 ## Commands
 
@@ -19,7 +19,7 @@ sh -n docker-entrypoint.sh                 # entrypoint syntax
 
 CI (`.github/workflows/validate.yml`, Node 20) runs these checks. It also verifies that every relative `](./...)` link in `README.md` and `README_en.md` points to a file that exists. The tests import the worker and replace `globalThis.fetch` with a mock that records upstream calls. `endpointCache` is module-level and shared across tests, so each test uses its own model names.
 
-To run locally, put secrets in `.dev.vars`, then run `wrangler dev`. Deploy with `wrangler deploy`. The Docker image only wraps `wrangler dev --local` for local debugging. Pushing a `v*` tag builds the image, pushes it to Docker Hub, and creates a GitHub release.
+To run locally, put secrets in `.dev.vars`, then run `wrangler dev`. Deploy with `wrangler deploy`. The Docker image only wraps `wrangler dev --local` for local debugging.
 
 ## Architecture
 
@@ -30,7 +30,14 @@ Every request goes to Azure's OpenAI-compatible v1 API: `{endpoint}/openai/v1{pa
 - **Endpoints:** `parseEndpoints` builds the resource list from `AZURE_ENDPOINTS` (`url` or `url|key`, comma- or newline-separated), then appends the legacy `AZURE_OAI_ENDPOINT` / `AZURE_INFER_ENDPOINT`. `endpointKind` labels each resource by hostname: `oai` for `*.openai.azure.com` / `*.cognitiveservices.azure.com`, `infer` for `*.services.ai.azure.com`, `null` otherwise. A resource without its own key uses `AZURE_API_KEY`.
 - **Resource order:** in priority order: the endpoint in `endpointCache` (per isolate, the one that last served this deployment), the endpoint pinned by `entry.endpoint` (substring match), then endpoints whose kind matches `entry.backend` or `OAI_MODEL_PATTERN`. All remaining endpoints follow in config order. Each one is a fallback for the one before it.
 
-`proxyToAzure` tries the endpoints in order. It moves on to the next one only when `isDeploymentMissing` returns true: a 404, or a 400 whose body looks like an unknown-model error. The last endpoint's response is always returned to the client. `fetchUpstream` applies an `AbortController` timeout (`UPSTREAM_TIMEOUT_MS`, default 120s; this covers time-to-first-byte only, so SSE keeps streaming afterwards). A timeout becomes a 504.
+`proxyToAzure` tries the endpoints in order. `classifyUpstream` sorts each response into one of three cases:
+- `missing`: a 404, or a 400 whose body looks like an unknown-model error. The proxy tries the next endpoint.
+- `retry`: a 429 or 5xx. The proxy tries the next endpoint, and a network error is treated the same way.
+- `final`: anything else. That response is returned to the client.
+
+The first `retry` response is buffered (`held`). If every endpoint after it is only `missing`, the proxy returns that buffered 429/5xx instead of the last 404. Only a 2xx updates `endpointCache`.
+
+Every upstream request ends with one `logRequest` JSON line: path, model, deployment, client key label (`key#N`), status, per-endpoint `attempts`, `ttfb_ms`. Rejected client keys log a 401 line. Never log keys or request/response bodies. Tests replace `console.log` to capture these lines. `fetchUpstream` applies an `AbortController` timeout (`UPSTREAM_TIMEOUT_MS`, default 120s; this covers time-to-first-byte only, so SSE keeps streaming afterwards). A timeout becomes a 504.
 
 Multipart routes go through `proxyMultipart` before any JSON parsing. It rebuilds the form with `model` replaced by the deployment name.
 
