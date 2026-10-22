@@ -167,16 +167,18 @@ wrangler login
 
 ```toml
 [vars]
-AZURE_OAI_ENDPOINT      = "https://your-resource.cognitiveservices.azure.com"
-AZURE_INFER_ENDPOINT    = "https://your-project.services.ai.azure.com"
 MODEL_LIST              = "gpt-5.5,gpt-5.4,grok-4-20,deepseek-r1"
 ALLOWED_ORIGINS         = "https://chat.example.com"
 UPSTREAM_TIMEOUT_MS     = "120000"
 ```
 
+如果你的仓库是公开的，不要把 Azure endpoint 写进 `wrangler.toml`，改用下面的 secret 设置。
+
 敏感信息使用 secret：
 
 ```bash
+wrangler secret put AZURE_OAI_ENDPOINT
+wrangler secret put AZURE_INFER_ENDPOINT
 wrangler secret put AZURE_API_KEY
 wrangler secret put CLIENT_API_KEYS
 wrangler secret put MODEL_MAPPING

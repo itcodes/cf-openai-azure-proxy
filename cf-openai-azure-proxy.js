@@ -8,8 +8,8 @@
 //
 // Env vars (set in Workers dashboard -> Settings -> Variables):
 //   AZURE_API_KEY            (Secret) Shared key for both resources when CLIENT_API_KEYS is enabled
-//   AZURE_OAI_ENDPOINT       e.g. https://yoyo.cognitiveservices.azure.com
-//   AZURE_INFER_ENDPOINT     e.g. https://waytoagi.services.ai.azure.com
+//   AZURE_OAI_ENDPOINT       e.g. https://your-resource.cognitiveservices.azure.com
+//   AZURE_INFER_ENDPOINT     e.g. https://your-project.services.ai.azure.com
 //   MODEL_MAPPING            optional JSON aliases, see DEFAULT_MAPPING below
 //   MODEL_LIST               optional comma-separated model ids for GET /v1/models
 //   CLIENT_API_KEYS          comma-separated list, e.g. sk-abc,sk-def (optional but recommended)
