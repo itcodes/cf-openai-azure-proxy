@@ -11,8 +11,7 @@ enabled = true
 [vars]
 AZURE_OAI_ENDPOINT      = "https://yoyo.cognitiveservices.azure.com"
 AZURE_INFER_ENDPOINT    = "https://waytoagi.services.ai.azure.com"
-AZURE_OAI_API_VERSION   = "2025-04-01-preview"
-AZURE_INFER_API_VERSION = "2024-05-01-preview"
+# MODEL_LIST            = "gpt-5.5,gpt-5.4,grok-4-20,deepseek-r1"   # what GET /v1/models shows
 # ALLOWED_ORIGINS       = "https://chat.example.com"
 # UPSTREAM_TIMEOUT_MS   = "120000"
 
@@ -20,29 +19,14 @@ AZURE_INFER_API_VERSION = "2024-05-01-preview"
 #
 #   wrangler secret put AZURE_API_KEY        # Required if CLIENT_API_KEYS is configured
 #   wrangler secret put CLIENT_API_KEYS      # sk-xxx,sk-yyy  (comma-separated client allowlist)
-#   wrangler secret put MODEL_MAPPING        # Optional — override the built-in mapping (JSON string)
+#   wrangler secret put MODEL_MAPPING        # Optional — model aliases (JSON string)
 #
-# Example MODEL_MAPPING JSON (paste as a single line when running the command):
+# Model names are sent to Azure as deployment names, so MODEL_MAPPING is only
+# needed when the name a client uses differs from the deployment name. Example
+# (paste as a single line when running the command):
 # {
-#   "gpt-chat-latest":       {"backend":"oai",   "deployment":"gpt-5.5"},
-#   "gpt-5.5":               {"backend":"oai",   "deployment":"gpt-5.5"},
-#   "gpt-5.4":               {"backend":"oai",   "deployment":"gpt-5.4"},
-#   "gpt-4o":                {"backend":"oai",   "deployment":"gpt-4o"},
-#   "gpt-4o-mini":           {"backend":"oai",   "deployment":"gpt-4o-mini"},
-#   "o1":                    {"backend":"oai",   "deployment":"o1"},
-#   "o3-mini":               {"backend":"oai",   "deployment":"o3-mini"},
-#   "gpt-image-1":           {"backend":"oai",   "deployment":"gpt-image-1",   "apiVersion":"2024-02-01"},
-#   "gpt-image-1.5":         {"backend":"oai",   "deployment":"gpt-image-1.5", "apiVersion":"2024-02-01"},
-#   "dall-e-3":              {"backend":"oai",   "deployment":"dall-e-3"},
-#   "text-embedding-3-small":{"backend":"oai",   "deployment":"text-embedding-3-small"},
-#   "text-embedding-3-large":{"backend":"oai",   "deployment":"text-embedding-3-large"},
-#   "whisper-1":             {"backend":"oai",   "deployment":"whisper-1"},
-#   "tts-1":                 {"backend":"oai",   "deployment":"tts-1"},
-#   "grok-4-20":             {"backend":"infer", "deployment":"grok-4-20"},
-#   "grok-3":                {"backend":"infer", "deployment":"grok-3"},
-#   "deepseek-r1":           {"backend":"infer", "deployment":"deepseek-r1"},
-#   "deepseek-v3":           {"backend":"infer", "deployment":"deepseek-v3"},
-#   "llama-3.3-70b":         {"backend":"infer", "deployment":"llama-3.3-70b"}
+#   "gpt-chat-latest": "gpt-5.5",
+#   "my-grok":         {"deployment":"grok-4-20", "backend":"infer"}
 # }
 
 # ------------------------------------------------------------

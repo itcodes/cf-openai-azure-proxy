@@ -1,22 +1,21 @@
 // Cloudflare Workers proxy: OpenAI-compatible -> Azure AI Foundry
-// Supports three upstream shapes:
-//   1. Classic Azure OpenAI   : {OAI}/openai/deployments/{deployment}/{endpoint}?api-version=...
-//   2. Responses API          : {OAI}/openai/responses?api-version=...   (model in body, no deployment in URL)
-//   3. Azure Model Inference  : {INFER}/models/{endpoint}?api-version=... (model in body, no deployment in URL)
+// Every request goes to Azure's OpenAI-compatible v1 API:
+//   {endpoint}/openai/v1/{path}   (deployment name in body.model, no api-version)
+// Two resources can be configured (AZURE_OAI_ENDPOINT, AZURE_INFER_ENDPOINT). The
+// model name picks which one is tried first; if that resource doesn't have the
+// deployment, the request is retried on the other one. Model names are passed
+// through as deployment names, so new deployments work without code changes.
 //
-// Required env vars (set in Workers dashboard -> Settings -> Variables):
+// Env vars (set in Workers dashboard -> Settings -> Variables):
 //   AZURE_API_KEY            (Secret) Shared key for both resources when CLIENT_API_KEYS is enabled
 //   AZURE_OAI_ENDPOINT       e.g. https://yoyo.cognitiveservices.azure.com
 //   AZURE_INFER_ENDPOINT     e.g. https://waytoagi.services.ai.azure.com
-//   AZURE_OAI_API_VERSION    default 2025-04-01-preview
-//   AZURE_INFER_API_VERSION  default 2024-05-01-preview
-//   MODEL_MAPPING            JSON string, see DEFAULT_MAPPING below
+//   MODEL_MAPPING            optional JSON aliases, see DEFAULT_MAPPING below
+//   MODEL_LIST               optional comma-separated model ids for GET /v1/models
 //   CLIENT_API_KEYS          comma-separated list, e.g. sk-abc,sk-def (optional but recommended)
 //   ALLOWED_ORIGINS          comma-separated browser origins allowed by CORS (optional)
 //   UPSTREAM_TIMEOUT_MS      timeout for upstream Azure requests in milliseconds (optional)
 
-const DEFAULT_OAI_API_VERSION = "2025-04-01-preview";
-const DEFAULT_INFER_API_VERSION = "2024-05-01-preview";
 // Default governs time-to-first-byte. 120s accommodates reasoning models (o1,
 // gpt-5.x) whose non-streaming TTFB routinely exceeds 30s.
 const DEFAULT_UPSTREAM_TIMEOUT_MS = 120000;
@@ -57,34 +56,45 @@ const TEXT_ENCODER = new TextEncoder();
 
 let cachedModelMappingRaw = null;
 let cachedModelMapping = null;
+// deployment -> endpoint that served it last, so a fallback hit isn't repeated
+// on every request handled by this isolate.
+const endpointCache = new Map();
 
+const JSON_ROUTES = new Set([
+  "/chat/completions",
+  "/responses",
+  "/completions",
+  "/embeddings",
+  "/images/generations",
+  "/audio/speech"
+]);
+// Multipart routes (audio + image edits) — must not json-parse the body
+const MULTIPART_ROUTES = new Set([
+  "/audio/transcriptions",
+  "/audio/translations",
+  "/images/edits",
+  "/images/variations"
+]);
+
+// Models whose names match this are tried on AZURE_OAI_ENDPOINT first;
+// everything else (grok, deepseek, llama, ...) on AZURE_INFER_ENDPOINT first.
+const OAI_MODEL_PATTERN = /^(gpt-|chatgpt-|o\d|text-embedding-|dall-e-|whisper|tts-|codex-|sora|computer-use)/i;
+
+// Aliases only. Unmapped model names are used as the deployment name directly.
+// Values are a deployment name, or { deployment, backend: "oai" | "infer" } to
+// pin which resource is tried first.
 const DEFAULT_MAPPING = {
-  // OpenAI-family on yoyo (classic + responses share the same entry;
-  // the proxy picks the upstream path based on which client path was hit)
-  "gpt-chat-latest":       { backend: "oai",   deployment: "gpt-5.5" },
-  "gpt-5.5":               { backend: "oai",   deployment: "gpt-5.5" },
-  "gpt-5.4":               { backend: "oai",   deployment: "gpt-5.4" },
-  "gpt-4o":                { backend: "oai",   deployment: "gpt-4o" },
-  "gpt-4o-mini":           { backend: "oai",   deployment: "gpt-4o-mini" },
-  "o1":                    { backend: "oai",   deployment: "o1" },
-  "o3-mini":               { backend: "oai",   deployment: "o3-mini" },
-
-  "gpt-image-1":           { backend: "oai",   deployment: "gpt-image-1",   apiVersion: "2024-02-01" },
-  "gpt-image-1.5":         { backend: "oai",   deployment: "gpt-image-1.5", apiVersion: "2024-02-01" },
-  "dall-e-3":              { backend: "oai",   deployment: "dall-e-3" },
-
-  "text-embedding-3-small":{ backend: "oai",   deployment: "text-embedding-3-small" },
-  "text-embedding-3-large":{ backend: "oai",   deployment: "text-embedding-3-large" },
-  "whisper-1":             { backend: "oai",   deployment: "whisper-1" },
-  "tts-1":                 { backend: "oai",   deployment: "tts-1" },
-
-  // Non-OpenAI models on waytoagi (Azure AI Model Inference)
-  "grok-4-20":             { backend: "infer", deployment: "grok-4-20" },
-  "grok-3":                { backend: "infer", deployment: "grok-3" },
-  "deepseek-r1":           { backend: "infer", deployment: "deepseek-r1" },
-  "deepseek-v3":           { backend: "infer", deployment: "deepseek-v3" },
-  "llama-3.3-70b":         { backend: "infer", deployment: "llama-3.3-70b" }
+  "gpt-chat-latest": "gpt-5.5"
 };
+
+// What GET /v1/models advertises when MODEL_LIST is unset. Purely cosmetic:
+// models missing here still work.
+const DEFAULT_MODEL_LIST = [
+  "gpt-5.5", "gpt-5.4", "gpt-4o", "gpt-4o-mini", "o1", "o3-mini",
+  "gpt-image-1", "gpt-image-1.5", "dall-e-3",
+  "text-embedding-3-small", "text-embedding-3-large", "whisper-1", "tts-1",
+  "grok-4-20", "grok-3", "deepseek-r1", "deepseek-v3", "llama-3.3-70b"
+];
 
 export default {
   async fetch(request, env) {
@@ -111,15 +121,15 @@ export default {
         return listModels(cfg, request);
       }
 
-      // Multipart routes (audio + image edits) — must not json-parse the body
-      if (path === "/audio/transcriptions" || path === "/audio/translations" ||
-          path === "/images/edits" || path === "/images/variations") {
+      if (MULTIPART_ROUTES.has(path)) {
         return proxyMultipart(request, path, cfg);
       }
 
-      // JSON routes
       if (request.method !== "POST") {
         return errorResponse(404, "not_found", `No handler for ${request.method} ${path}`, request, cfg);
+      }
+      if (!JSON_ROUTES.has(path)) {
+        return errorResponse(404, "not_found", `Unsupported path: ${url.pathname}`, request, cfg);
       }
 
       const body = await request.json().catch(() => null);
@@ -132,34 +142,15 @@ export default {
         return errorResponse(400, "invalid_request_error", "Missing 'model' field in request body", request, cfg, "model");
       }
 
-      const entry = cfg.mapping[modelName];
-      if (!entry) {
-        return errorResponse(400, "model_not_found", `Model '${modelName}' is not mapped. Update MODEL_MAPPING env var.`, request, cfg, "model");
-      }
-
-      // Route by client path + backend
-      const azureKey = resolveAzureKey(request, cfg);
-      if (path === "/chat/completions") {
-        return proxyChatCompletions(request, body, entry, cfg, azureKey);
-      }
-      if (path === "/responses") {
-        return proxyResponses(request, body, entry, cfg, azureKey);
-      }
-      if (path === "/completions") {
-        return proxyClassic(request, body, entry, cfg, "completions", azureKey);
-      }
-      if (path === "/embeddings") {
-        if (entry.backend === "infer") return proxyInference(request, body, entry, cfg, "embeddings", azureKey);
-        return proxyClassic(request, body, entry, cfg, "embeddings", azureKey);
-      }
-      if (path === "/images/generations") {
-        return proxyClassic(request, body, entry, cfg, "images/generations", azureKey);
-      }
-      if (path === "/audio/speech") {
-        return proxyClassic(request, body, entry, cfg, "audio/speech", azureKey);
-      }
-
-      return errorResponse(404, "not_found", `Unsupported path: ${url.pathname}`, request, cfg);
+      const target = resolveModel(modelName, cfg);
+      return proxyToAzure(
+        request,
+        cfg,
+        path,
+        target,
+        JSON.stringify({ ...body, model: target.deployment }),
+        { "Content-Type": "application/json" }
+      );
     } catch (e) {
       return errorResponse(500, "proxy_error", e.message || String(e), request, cfg);
     }
@@ -168,6 +159,7 @@ export default {
 
 function loadConfig(env) {
   const mapping = parseModelMapping(env.MODEL_MAPPING || "");
+  const modelList = splitCsv(env.MODEL_LIST || "");
   const clientKeys = splitCsv(env.CLIENT_API_KEYS || "");
   const allowedOrigins = splitCsv(env.ALLOWED_ORIGINS || "");
   const azureKey = (env.AZURE_API_KEY || "").trim();
@@ -178,13 +170,12 @@ function loadConfig(env) {
 
   return {
     mapping,
+    modelList: modelList.length > 0 ? modelList : DEFAULT_MODEL_LIST,
     clientKeys,
     allowedOrigins,
     azureKey,
     oaiEndpoint: stripTrailingSlash(env.AZURE_OAI_ENDPOINT || ""),
     inferEndpoint: stripTrailingSlash(env.AZURE_INFER_ENDPOINT || ""),
-    oaiApiVersion: env.AZURE_OAI_API_VERSION || DEFAULT_OAI_API_VERSION,
-    inferApiVersion: env.AZURE_INFER_API_VERSION || DEFAULT_INFER_API_VERSION,
     upstreamTimeoutMs: parseUpstreamTimeoutMs(env.UPSTREAM_TIMEOUT_MS || "")
   };
 }
@@ -286,83 +277,75 @@ function resolveAzureKey(request, cfg) {
   return auth.replace(/^Bearer\s+/i, "").trim();
 }
 
-async function proxyChatCompletions(request, body, entry, cfg, azureKey) {
-  if (entry.backend === "infer") {
-    return proxyInference(request, body, entry, cfg, "chat/completions", azureKey);
+function resolveModel(modelName, cfg) {
+  const entry = cfg.mapping[modelName];
+  const deployment = (typeof entry === "string" ? entry : entry && entry.deployment) || modelName;
+  const backend = (entry && typeof entry === "object" && entry.backend) ||
+    (OAI_MODEL_PATTERN.test(deployment) ? "oai" : "infer");
+
+  const ordered = backend === "infer"
+    ? [cfg.inferEndpoint, cfg.oaiEndpoint]
+    : [cfg.oaiEndpoint, cfg.inferEndpoint];
+  const endpoints = [...new Set(ordered.filter(Boolean))];
+
+  const cached = endpointCache.get(deployment);
+  if (cached && endpoints.includes(cached)) {
+    endpoints.splice(endpoints.indexOf(cached), 1);
+    endpoints.unshift(cached);
   }
-  return proxyClassic(request, body, entry, cfg, "chat/completions", azureKey);
+  return { deployment, endpoints };
 }
 
-async function proxyResponses(request, body, entry, cfg, azureKey) {
-  if (entry.backend !== "oai") {
-    return errorResponse(
-      400,
-      "invalid_request_error",
-      `Model '${body.model}' is on backend '${entry.backend}' which does not support /v1/responses`,
-      request,
-      cfg,
-      "model"
-    );
-  }
-  if (!cfg.oaiEndpoint) {
-    return errorResponse(500, "proxy_error", "AZURE_OAI_ENDPOINT is not set", request, cfg);
+async function proxyToAzure(request, cfg, path, target, body, extraHeaders = {}) {
+  if (target.endpoints.length === 0) {
+    return errorResponse(500, "proxy_error", "Neither AZURE_OAI_ENDPOINT nor AZURE_INFER_ENDPOINT is set", request, cfg);
   }
 
-  const apiVersion = entry.apiVersion || cfg.oaiApiVersion;
-  const upstream = `${cfg.oaiEndpoint}/openai/responses?api-version=${apiVersion}`;
-  const upstreamBody = { ...body, model: entry.deployment };
-  return fetchJsonUpstream(request, cfg, upstream, azureKey, upstreamBody);
-}
-
-async function proxyClassic(request, body, entry, cfg, endpoint, azureKey) {
-  if (entry.backend !== "oai") {
-    return errorResponse(
-      400,
-      "invalid_request_error",
-      `Model '${body.model}' is on backend '${entry.backend}' which does not support /${endpoint}`,
-      request,
-      cfg,
-      "model"
-    );
-  }
-  if (!cfg.oaiEndpoint) {
-    return errorResponse(500, "proxy_error", "AZURE_OAI_ENDPOINT is not set", request, cfg);
-  }
-
-  const apiVersion = entry.apiVersion || cfg.oaiApiVersion;
-  const upstream = `${cfg.oaiEndpoint}/openai/deployments/${entry.deployment}/${endpoint}?api-version=${apiVersion}`;
-  // Keep `model` in body as the deployment name — harmless for chat/completions,
-  // required by some endpoints (e.g. gpt-image-1 images/generations).
-  const upstreamBody = { ...body, model: entry.deployment };
-  return fetchJsonUpstream(request, cfg, upstream, azureKey, upstreamBody);
-}
-
-async function proxyInference(request, body, entry, cfg, endpoint, azureKey) {
-  if (!cfg.inferEndpoint) {
-    return errorResponse(500, "proxy_error", "AZURE_INFER_ENDPOINT is not set", request, cfg);
-  }
-
-  const upstream = `${cfg.inferEndpoint}/models/${endpoint}?api-version=${cfg.inferApiVersion}`;
-  const upstreamBody = { ...body, model: entry.deployment };
-  return fetchJsonUpstream(request, cfg, upstream, azureKey, upstreamBody);
-}
-
-async function fetchJsonUpstream(request, cfg, upstreamUrl, azureKey, body) {
-  return fetchUpstream(
-    request,
-    cfg,
-    upstreamUrl,
-    azureKey,
-    JSON.stringify(body),
-    { "Content-Type": "application/json" }
-  );
-}
-
-async function fetchUpstream(request, cfg, upstreamUrl, azureKey, body, extraHeaders = {}) {
+  const azureKey = resolveAzureKey(request, cfg);
   if (!azureKey) {
     return errorResponse(500, "proxy_error", "No Azure API key available (set AZURE_API_KEY or send Authorization header)", request, cfg);
   }
 
+  for (let i = 0; i < target.endpoints.length; i += 1) {
+    const endpoint = target.endpoints[i];
+    let resp;
+    try {
+      resp = await fetchUpstream(cfg, `${endpoint}/openai/v1${path}`, azureKey, body, extraHeaders);
+    } catch (e) {
+      if (e && e.name === "AbortError") {
+        return errorResponse(
+          504,
+          "upstream_timeout",
+          `Azure upstream timed out after ${cfg.upstreamTimeoutMs}ms`,
+          request,
+          cfg
+        );
+      }
+      throw e;
+    }
+
+    const isLast = i === target.endpoints.length - 1;
+    if (!isLast && await isDeploymentMissing(resp)) {
+      if (resp.body) await resp.body.cancel();
+      continue;
+    }
+    if (resp.ok) endpointCache.set(target.deployment, endpoint);
+
+    return new Response(resp.body, {
+      status: resp.status,
+      headers: buildClientResponseHeaders(resp.headers, request, cfg)
+    });
+  }
+}
+
+async function isDeploymentMissing(resp) {
+  if (resp.status === 404) return true;
+  if (resp.status !== 400) return false;
+  const text = await resp.clone().text().catch(() => "");
+  return /DeploymentNotFound|unknown_model|model_not_found|unknown model/i.test(text);
+}
+
+async function fetchUpstream(cfg, upstreamUrl, azureKey, body, extraHeaders) {
   const headers = new Headers(extraHeaders);
   headers.set("api-key", azureKey);
 
@@ -370,65 +353,34 @@ async function fetchUpstream(request, cfg, upstreamUrl, azureKey, body, extraHea
   const timeoutId = setTimeout(() => controller.abort(), cfg.upstreamTimeoutMs);
 
   try {
-    const resp = await fetch(upstreamUrl, {
+    return await fetch(upstreamUrl, {
       method: "POST",
       headers,
       body,
       signal: controller.signal
     });
-
-    return new Response(resp.body, {
-      status: resp.status,
-      headers: buildClientResponseHeaders(resp.headers, request, cfg)
-    });
-  } catch (e) {
-    if (e && e.name === "AbortError") {
-      return errorResponse(
-        504,
-        "upstream_timeout",
-        `Azure upstream timed out after ${cfg.upstreamTimeoutMs}ms`,
-        request,
-        cfg
-      );
-    }
-    throw e;
   } finally {
     clearTimeout(timeoutId);
   }
 }
 
 async function proxyMultipart(request, path, cfg) {
-  // Parse form to extract `model`, then rebuild (so we can still stream file parts).
+  // Parse form to extract `model`, then rebuild with the deployment name.
   const form = await request.formData();
   const modelName = form.get("model");
   if (typeof modelName !== "string" || !modelName) {
     return errorResponse(400, "invalid_request_error", "Missing 'model' field in form", request, cfg, "model");
   }
 
-  const entry = cfg.mapping[modelName];
-  if (!entry) {
-    return errorResponse(400, "model_not_found", `Model '${modelName}' is not mapped`, request, cfg, "model");
-  }
-  if (entry.backend !== "oai") {
-    return errorResponse(400, "invalid_request_error", `Model '${modelName}' does not support /${path}`, request, cfg, "model");
-  }
-  if (!cfg.oaiEndpoint) {
-    return errorResponse(500, "proxy_error", "AZURE_OAI_ENDPOINT is not set", request, cfg);
-  }
-
-  // Rebuild form without `model` (classic endpoint ignores it; some reject)
+  const target = resolveModel(modelName, cfg);
   const upstreamForm = new FormData();
   for (const [k, v] of form.entries()) {
     if (k === "model") continue;
     upstreamForm.append(k, v);
   }
+  upstreamForm.append("model", target.deployment);
 
-  const apiVersion = entry.apiVersion || cfg.oaiApiVersion;
-  const upstreamPath = path.replace(/^\//, "");
-  const upstream = `${cfg.oaiEndpoint}/openai/deployments/${entry.deployment}/${upstreamPath}?api-version=${apiVersion}`;
-  const azureKey = resolveAzureKey(request, cfg);
-
-  return fetchUpstream(request, cfg, upstream, azureKey, upstreamForm);
+  return proxyToAzure(request, cfg, path, target, upstreamForm);
 }
 
 function buildClientResponseHeaders(upstreamHeaders, request, cfg) {
@@ -486,12 +438,8 @@ function appendVary(headers, value) {
 
 function listModels(cfg, request) {
   const created = Math.floor(Date.now() / 1000);
-  const data = Object.keys(cfg.mapping).map((id) => ({
-    id,
-    object: "model",
-    created,
-    owned_by: cfg.mapping[id].backend === "infer" ? "azure-inference" : "azure-openai"
-  }));
+  const ids = [...new Set([...Object.keys(cfg.mapping), ...cfg.modelList])];
+  const data = ids.map((id) => ({ id, object: "model", created, owned_by: "azure" }));
 
   return new Response(JSON.stringify({ object: "list", data }, null, 2), {
     headers: buildClientResponseHeaders(new Headers({ "Content-Type": "application/json" }), request, cfg)
