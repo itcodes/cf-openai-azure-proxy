@@ -17,6 +17,7 @@ write_var() {
 
 rm -f "$DEV_VARS_FILE"
 
+write_var "AZURE_ENDPOINTS" "${AZURE_ENDPOINTS:-}"
 write_var "AZURE_API_KEY" "${AZURE_API_KEY:-}"
 write_var "AZURE_OAI_ENDPOINT" "${AZURE_OAI_ENDPOINT:-}"
 write_var "AZURE_INFER_ENDPOINT" "${AZURE_INFER_ENDPOINT:-}"

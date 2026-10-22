@@ -157,3 +157,64 @@ test("GET /v1/models lists aliases plus MODEL_LIST", async () => {
   const ids = (await resp.json()).data.map((m) => m.id);
   assert.deepEqual(ids, ["gpt-chat-latest", "a", "b"]);
 });
+
+const A = "https://a.openai.azure.com";
+const B = "https://b.cognitiveservices.azure.com";
+const F = "https://f.services.ai.azure.com";
+const MULTI = {
+  CLIENT_API_KEYS: "sk-test",
+  AZURE_ENDPOINTS: `${F}|key-f, ${A}/|key-a\n${B}|key-b`
+};
+const hosts = () => calls.map((c) => c.url.split("/openai")[0]);
+
+test("AZURE_ENDPOINTS: OpenAI-family models try OpenAI resources first, each with its own key", async () => {
+  responder = () => Response.json({ error: { code: "DeploymentNotFound" } }, { status: 404 });
+  await worker.fetch(post("/v1/chat/completions", { model: "gpt-multi-1" }), MULTI);
+  assert.deepEqual(hosts(), [A, B, F]);
+  assert.deepEqual(calls.map((c) => c.init.headers.get("api-key")), ["key-a", "key-b", "key-f"]);
+});
+
+test("AZURE_ENDPOINTS: other models try Foundry resources first", async () => {
+  responder = () => Response.json({ error: { code: "DeploymentNotFound" } }, { status: 404 });
+  await worker.fetch(post("/v1/chat/completions", { model: "grok-multi-1" }), MULTI);
+  assert.deepEqual(hosts(), [F, A, B]);
+});
+
+test("AZURE_ENDPOINTS: the resource that served a deployment is tried first next time", async () => {
+  responder = ({ url }) => url.startsWith(B)
+    ? Response.json({ ok: true })
+    : Response.json({ error: { code: "DeploymentNotFound" } }, { status: 404 });
+  await worker.fetch(post("/v1/chat/completions", { model: "gpt-multi-2" }), MULTI);
+  assert.deepEqual(hosts(), [A, B]);
+
+  calls = [];
+  await worker.fetch(post("/v1/chat/completions", { model: "gpt-multi-2" }), MULTI);
+  assert.deepEqual(hosts(), [B]);
+});
+
+test("MODEL_MAPPING endpoint pins a specific resource", async () => {
+  const env = { ...MULTI, MODEL_MAPPING: JSON.stringify({ special: { deployment: "gpt-x", endpoint: "b.cognitiveservices" } }) };
+  await worker.fetch(post("/v1/chat/completions", { model: "special" }), env);
+  assert.deepEqual(hosts(), [B]);
+});
+
+test("AZURE_ENDPOINTS entries without a key fall back to AZURE_API_KEY, legacy vars are appended", async () => {
+  responder = () => Response.json({ error: { code: "DeploymentNotFound" } }, { status: 404 });
+  const env = { CLIENT_API_KEYS: "sk-test", AZURE_API_KEY: "shared", AZURE_ENDPOINTS: A, AZURE_INFER_ENDPOINT: F };
+  await worker.fetch(post("/v1/chat/completions", { model: "gpt-multi-3" }), env);
+  assert.deepEqual(hosts(), [A, F]);
+  assert.deepEqual(calls.map((c) => c.init.headers.get("api-key")), ["shared", "shared"]);
+});
+
+test("CLIENT_API_KEYS requires a key for every endpoint", async () => {
+  const resp = await worker.fetch(post("/v1/chat/completions", { model: "gpt-9" }), { CLIENT_API_KEYS: "sk-test", AZURE_ENDPOINTS: `${A}|k,${B}` });
+  assert.equal(resp.status, 500);
+  assert.match((await resp.json()).error.message, /AZURE_API_KEY/);
+  assert.equal(calls.length, 0);
+});
+
+test("invalid endpoint URL is a config error", async () => {
+  const resp = await worker.fetch(post("/v1/chat/completions", { model: "gpt-9" }), { AZURE_API_KEY: "k", AZURE_ENDPOINTS: "not a url" });
+  assert.equal(resp.status, 500);
+  assert.match((await resp.json()).error.message, /Invalid Azure endpoint URL/);
+});

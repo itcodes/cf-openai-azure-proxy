@@ -1,15 +1,18 @@
 // Cloudflare Workers proxy: OpenAI-compatible -> Azure AI Foundry
 // Every request goes to Azure's OpenAI-compatible v1 API:
 //   {endpoint}/openai/v1/{path}   (deployment name in body.model, no api-version)
-// Two resources can be configured (AZURE_OAI_ENDPOINT, AZURE_INFER_ENDPOINT). The
-// model name picks which one is tried first; if that resource doesn't have the
-// deployment, the request is retried on the other one. Model names are passed
-// through as deployment names, so new deployments work without code changes.
+// Any number of Azure resources can be configured. The model name picks which
+// kind of resource is tried first (Azure OpenAI vs. AI Foundry); if a resource
+// doesn't have the deployment, the request is retried on the next one. Model
+// names are passed through as deployment names, so new deployments work without
+// code changes.
 //
 // Env vars (set in Workers dashboard -> Settings -> Variables):
-//   AZURE_API_KEY            (Secret) Shared key for both resources when CLIENT_API_KEYS is enabled
-//   AZURE_OAI_ENDPOINT       e.g. https://your-resource.cognitiveservices.azure.com
-//   AZURE_INFER_ENDPOINT     e.g. https://your-project.services.ai.azure.com
+//   AZURE_ENDPOINTS          comma/newline-separated resources, each `url` or `url|key`, e.g.
+//                            https://a.openai.azure.com|key1,https://b.services.ai.azure.com|key2
+//   AZURE_API_KEY            (Secret) Key for resources listed without their own key
+//   AZURE_OAI_ENDPOINT       legacy single Azure OpenAI resource, appended to AZURE_ENDPOINTS
+//   AZURE_INFER_ENDPOINT     legacy single AI Foundry resource, appended to AZURE_ENDPOINTS
 //   MODEL_MAPPING            optional JSON aliases, see DEFAULT_MAPPING below
 //   MODEL_LIST               optional comma-separated model ids for GET /v1/models
 //   CLIENT_API_KEYS          comma-separated list, e.g. sk-abc,sk-def (optional but recommended)
@@ -76,8 +79,8 @@ const MULTIPART_ROUTES = new Set([
   "/images/variations"
 ]);
 
-// Models whose names match this are tried on AZURE_OAI_ENDPOINT first;
-// everything else (grok, deepseek, llama, ...) on AZURE_INFER_ENDPOINT first.
+// Models whose names match this are tried on Azure OpenAI resources first;
+// everything else (grok, deepseek, llama, ...) on AI Foundry resources first.
 const OAI_MODEL_PATTERN = /^(gpt-|chatgpt-|o\d|text-embedding-|dall-e-|whisper|tts-|codex-|sora|computer-use)/i;
 
 // Aliases only. Unmapped model names are used as the deployment name directly.
@@ -163,9 +166,10 @@ function loadConfig(env) {
   const clientKeys = splitCsv(env.CLIENT_API_KEYS || "");
   const allowedOrigins = splitCsv(env.ALLOWED_ORIGINS || "");
   const azureKey = (env.AZURE_API_KEY || "").trim();
+  const endpoints = parseEndpoints(env);
 
-  if (clientKeys.length > 0 && !azureKey) {
-    throw new Error("AZURE_API_KEY is required when CLIENT_API_KEYS is configured");
+  if (clientKeys.length > 0 && !azureKey && endpoints.some((e) => !e.key)) {
+    throw new Error("AZURE_API_KEY (or a per-endpoint key in AZURE_ENDPOINTS) is required when CLIENT_API_KEYS is configured");
   }
 
   return {
@@ -174,10 +178,43 @@ function loadConfig(env) {
     clientKeys,
     allowedOrigins,
     azureKey,
-    oaiEndpoint: stripTrailingSlash(env.AZURE_OAI_ENDPOINT || ""),
-    inferEndpoint: stripTrailingSlash(env.AZURE_INFER_ENDPOINT || ""),
+    endpoints,
     upstreamTimeoutMs: parseUpstreamTimeoutMs(env.UPSTREAM_TIMEOUT_MS || "")
   };
+}
+
+function parseEndpoints(env) {
+  const entries = (env.AZURE_ENDPOINTS || "").split(/[,\n]/).map((s) => s.trim()).filter(Boolean)
+    .map((item) => {
+      const [url, key = ""] = item.split("|").map((s) => s.trim());
+      return { url, key, kind: endpointKind(url) };
+    });
+  if (env.AZURE_OAI_ENDPOINT) entries.push({ url: env.AZURE_OAI_ENDPOINT.trim(), key: "", kind: "oai" });
+  if (env.AZURE_INFER_ENDPOINT) entries.push({ url: env.AZURE_INFER_ENDPOINT.trim(), key: "", kind: "infer" });
+
+  const seen = new Set();
+  const endpoints = [];
+  for (const entry of entries) {
+    let parsed;
+    try {
+      parsed = new URL(entry.url);
+    } catch {
+      throw new Error(`Invalid Azure endpoint URL: ${entry.url}`);
+    }
+    const url = stripTrailingSlash(parsed.origin + parsed.pathname);
+    if (seen.has(url)) continue;
+    seen.add(url);
+    endpoints.push({ ...entry, url });
+  }
+  return endpoints;
+}
+
+// "oai" for Azure OpenAI resources, "infer" for AI Foundry, null if unknown
+// (custom domain, APIM, ...), which keeps the configured order.
+function endpointKind(url) {
+  if (/\.(openai|cognitiveservices)\.azure\.com/i.test(url)) return "oai";
+  if (/\.(services|models)\.ai\.azure\.com/i.test(url)) return "infer";
+  return null;
 }
 
 function parseModelMapping(raw) {
@@ -271,7 +308,8 @@ function timingSafeEqual(a, b) {
   return diff === 0;
 }
 
-function resolveAzureKey(request, cfg) {
+function resolveAzureKey(request, cfg, endpoint) {
+  if (endpoint.key) return endpoint.key;
   if (cfg.azureKey) return cfg.azureKey;
   const auth = request.headers.get("Authorization") || "";
   return auth.replace(/^Bearer\s+/i, "").trim();
@@ -280,37 +318,39 @@ function resolveAzureKey(request, cfg) {
 function resolveModel(modelName, cfg) {
   const entry = cfg.mapping[modelName];
   const deployment = (typeof entry === "string" ? entry : entry && entry.deployment) || modelName;
-  const backend = (entry && typeof entry === "object" && entry.backend) ||
-    (OAI_MODEL_PATTERN.test(deployment) ? "oai" : "infer");
+  const pinned = entry && typeof entry === "object" ? entry : {};
+  const backend = pinned.backend || (OAI_MODEL_PATTERN.test(deployment) ? "oai" : "infer");
 
-  const ordered = backend === "infer"
-    ? [cfg.inferEndpoint, cfg.oaiEndpoint]
-    : [cfg.oaiEndpoint, cfg.inferEndpoint];
-  const endpoints = [...new Set(ordered.filter(Boolean))];
-
+  // Priority: endpoint that last served this deployment, endpoint pinned in
+  // MODEL_MAPPING, endpoints of the preferred kind, then the rest in config order.
   const cached = endpointCache.get(deployment);
-  if (cached && endpoints.includes(cached)) {
-    endpoints.splice(endpoints.indexOf(cached), 1);
-    endpoints.unshift(cached);
-  }
+  const rank = (e) => {
+    if (e.url === cached) return 0;
+    if (pinned.endpoint && e.url.includes(stripTrailingSlash(pinned.endpoint))) return 1;
+    return e.kind === backend ? 2 : 3;
+  };
+  const endpoints = cfg.endpoints
+    .map((e, i) => ({ e, i }))
+    .sort((a, b) => rank(a.e) - rank(b.e) || a.i - b.i)
+    .map(({ e }) => e);
   return { deployment, endpoints };
 }
 
 async function proxyToAzure(request, cfg, path, target, body, extraHeaders = {}) {
   if (target.endpoints.length === 0) {
-    return errorResponse(500, "proxy_error", "Neither AZURE_OAI_ENDPOINT nor AZURE_INFER_ENDPOINT is set", request, cfg);
-  }
-
-  const azureKey = resolveAzureKey(request, cfg);
-  if (!azureKey) {
-    return errorResponse(500, "proxy_error", "No Azure API key available (set AZURE_API_KEY or send Authorization header)", request, cfg);
+    return errorResponse(500, "proxy_error", "No Azure endpoint configured (set AZURE_ENDPOINTS)", request, cfg);
   }
 
   for (let i = 0; i < target.endpoints.length; i += 1) {
     const endpoint = target.endpoints[i];
+    const azureKey = resolveAzureKey(request, cfg, endpoint);
+    if (!azureKey) {
+      return errorResponse(500, "proxy_error", "No Azure API key available (set AZURE_API_KEY or send Authorization header)", request, cfg);
+    }
+
     let resp;
     try {
-      resp = await fetchUpstream(cfg, `${endpoint}/openai/v1${path}`, azureKey, body, extraHeaders);
+      resp = await fetchUpstream(cfg, `${endpoint.url}/openai/v1${path}`, azureKey, body, extraHeaders);
     } catch (e) {
       if (e && e.name === "AbortError") {
         return errorResponse(
@@ -329,7 +369,7 @@ async function proxyToAzure(request, cfg, path, target, body, extraHeaders = {})
       if (resp.body) await resp.body.cancel();
       continue;
     }
-    if (resp.ok) endpointCache.set(target.deployment, endpoint);
+    if (resp.ok) endpointCache.set(target.deployment, endpoint.url);
 
     return new Response(resp.body, {
       status: resp.status,

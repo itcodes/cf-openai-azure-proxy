@@ -16,9 +16,9 @@ enabled = true
 
 # Secrets — set via CLI, never commit them:
 #
-#   wrangler secret put AZURE_OAI_ENDPOINT   # e.g. https://your-resource.cognitiveservices.azure.com
-#   wrangler secret put AZURE_INFER_ENDPOINT # e.g. https://your-project.services.ai.azure.com
-#   wrangler secret put AZURE_API_KEY        # Required if CLIENT_API_KEYS is configured
+#   wrangler secret put AZURE_ENDPOINTS      # url or url|key, comma-separated, e.g.
+#                                            # https://a.openai.azure.com|key1,https://b.services.ai.azure.com|key2
+#   wrangler secret put AZURE_API_KEY        # Default key for entries without one
 #   wrangler secret put CLIENT_API_KEYS      # sk-xxx,sk-yyy  (comma-separated client allowlist)
 #   wrangler secret put MODEL_MAPPING        # Optional — model aliases (JSON string)
 #

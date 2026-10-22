@@ -27,8 +27,8 @@ The `fetch` handler runs these steps in order: `loadConfig`, then origin check (
 
 Every request goes to Azure's OpenAI-compatible v1 API: `{endpoint}/openai/v1{path}`. The deployment name is in `body.model`, and there is no `api-version`. `resolveModel` handles the model lookup:
 - **Deployment name:** the `MODEL_MAPPING` alias if one exists (a string value, or `{deployment, backend}`), otherwise the client's model name as-is. The mapping is optional.
-- **Resource order:** `entry.backend` decides which resource is tried first, or `OAI_MODEL_PATTERN` when the entry has no backend. Matches try `AZURE_OAI_ENDPOINT` first; all other names try `AZURE_INFER_ENDPOINT` first. The other configured endpoint is the fallback.
-- **Cache:** `endpointCache` (per isolate) moves the endpoint that last served a deployment to the front of the list.
+- **Endpoints:** `parseEndpoints` builds the resource list from `AZURE_ENDPOINTS` (`url` or `url|key`, comma- or newline-separated), then appends the legacy `AZURE_OAI_ENDPOINT` / `AZURE_INFER_ENDPOINT`. `endpointKind` labels each resource by hostname: `oai` for `*.openai.azure.com` / `*.cognitiveservices.azure.com`, `infer` for `*.services.ai.azure.com`, `null` otherwise. A resource without its own key uses `AZURE_API_KEY`.
+- **Resource order:** in priority order: the endpoint in `endpointCache` (per isolate, the one that last served this deployment), the endpoint pinned by `entry.endpoint` (substring match), then endpoints whose kind matches `entry.backend` or `OAI_MODEL_PATTERN`. All remaining endpoints follow in config order. Each one is a fallback for the one before it.
 
 `proxyToAzure` tries the endpoints in order. It moves on to the next one only when `isDeploymentMissing` returns true: a 404, or a 400 whose body looks like an unknown-model error. The last endpoint's response is always returned to the client. `fetchUpstream` applies an `AbortController` timeout (`UPSTREAM_TIMEOUT_MS`, default 120s; this covers time-to-first-byte only, so SSE keeps streaming afterwards). A timeout becomes a 504.
 

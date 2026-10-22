@@ -11,7 +11,7 @@ Many desktop and mobile clients only know how to talk to the OpenAI API. This pr
 
 - clients keep calling `/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`, and similar OpenAI-style routes
 - the Worker forwards the request to Azure's `/openai/v1/*` API, using the client's `model` as the deployment name
-- with two Azure resources configured (Azure OpenAI + Azure AI Foundry), it picks one from the model name and falls back to the other if the deployment isn't there
+- any number of Azure resources can be configured (Azure OpenAI and Azure AI Foundry, mixed), each with its own key; the model name decides which kind is tried first, and it falls back to the next resource if the deployment isn't there
 
 This is a stateless proxy. It is not a chatbot app, billing system, admin panel, or database-backed service.
 
@@ -41,11 +41,12 @@ OpenAI-compatible client
   -> Cloudflare Worker
   -> validate Authorization / CLIENT_API_KEYS
   -> read body.model, apply MODEL_MAPPING alias if any -> deployment name
-  -> pick which resource to try first
-     - gpt-* / o1 / o3 / text-embedding-* / dall-e-* / whisper / tts-* -> AZURE_OAI_ENDPOINT
-     - everything else (grok, deepseek, llama, ...)                  -> AZURE_INFER_ENDPOINT
+  -> order the resources
+     - gpt-* / o1 / o3 / text-embedding-* / dall-e-* / whisper / tts-* -> *.openai.azure.com / *.cognitiveservices.azure.com first
+     - everything else (grok, deepseek, llama, ...)                  -> *.services.ai.azure.com first
+     - ties and unrecognized hosts keep their AZURE_ENDPOINTS order
   -> POST {endpoint}/openai/v1/{path} with model = deployment name
-  -> if that resource answers 404 / unknown model, retry on the other one
+  -> if that resource answers 404 / unknown model, retry on the next one
   -> return the upstream response as-is
 ```
 
@@ -57,9 +58,9 @@ Configure these in Cloudflare Workers Variables / Secrets:
 
 | Variable | Required | Description |
 |---|---|---|
-| `AZURE_API_KEY` | Recommended | Azure API key used by the Worker when calling Azure (the same key is used for both resources) |
-| `AZURE_OAI_ENDPOINT` | At least one endpoint | Azure OpenAI resource, e.g. `https://your-resource.cognitiveservices.azure.com` |
-| `AZURE_INFER_ENDPOINT` | At least one endpoint | Azure AI Foundry resource, e.g. `https://your-project.services.ai.azure.com` |
+| `AZURE_ENDPOINTS` | Yes | Azure resources, comma- or newline-separated, each `url` or `url\|key`, e.g. `https://a.openai.azure.com\|key1,https://b.services.ai.azure.com\|key2` |
+| `AZURE_API_KEY` | Recommended | Default Azure key for resources in `AZURE_ENDPOINTS` listed without their own key |
+| `AZURE_OAI_ENDPOINT` / `AZURE_INFER_ENDPOINT` | No | Legacy single-resource settings, still supported; appended after `AZURE_ENDPOINTS` and use `AZURE_API_KEY` |
 | `CLIENT_API_KEYS` | Recommended | Comma-separated keys accepted by your proxy |
 | `ALLOWED_ORIGINS` | No | Comma-separated browser origins allowed by CORS, for example `https://chat.example.com` |
 | `UPSTREAM_TIMEOUT_MS` | No | Timeout for Azure upstream requests in milliseconds, defaults to `120000`. Bounds time-to-first-byte only — streaming bodies are not cut off once they start |
@@ -69,7 +70,7 @@ Configure these in Cloudflare Workers Variables / Secrets:
 Notes:
 
 - if `CLIENT_API_KEYS` is set, clients must use one of those keys to access the proxy
-- if `CLIENT_API_KEYS` is set, `AZURE_API_KEY` must also be set so client keys are never forwarded upstream by mistake
+- if `CLIENT_API_KEYS` is set, every resource must have a key (in `AZURE_ENDPOINTS` or via `AZURE_API_KEY`) so client keys are never forwarded upstream by mistake
 - if `CLIENT_API_KEYS` is not set, client auth is skipped
 - if `CLIENT_API_KEYS` is not set and `AZURE_API_KEY` is also not set, the Worker will try to forward the client's `Authorization: Bearer ...` value as the Azure key
 - if `ALLOWED_ORIGINS` is set, only those browser origins receive CORS access; non-browser clients are unaffected
@@ -82,11 +83,13 @@ Optional. Keys are the model names clients send; values are either the deploymen
 ```json
 {
   "gpt-chat-latest": "gpt-5.5",
-  "my-grok": { "deployment": "grok-4-20", "backend": "infer" }
+  "my-grok": { "deployment": "grok-4-20", "backend": "infer" },
+  "special": { "deployment": "gpt-6-astra", "endpoint": "bkbll.openai.azure.com" }
 }
 ```
 
-- `backend: "oai"` tries `AZURE_OAI_ENDPOINT` first, `backend: "infer"` tries `AZURE_INFER_ENDPOINT` first
+- `backend: "oai"` tries Azure OpenAI resources first, `backend: "infer"` tries AI Foundry resources first
+- `endpoint` pins which resource is tried first (the URL or any part of it)
 - without `MODEL_MAPPING`, the built-in mapping only aliases `gpt-chat-latest` to `gpt-5.5`
 - setting `MODEL_MAPPING` replaces the built-in mapping
 - mapped names are also listed by `GET /v1/models`
@@ -112,18 +115,16 @@ Copy the full contents of [cf-openai-azure-proxy.js](./cf-openai-azure-proxy.js)
 In the Worker Settings / Variables page, add:
 
 - regular variables for non-sensitive values
-  - `AZURE_OAI_ENDPOINT`
-  - `AZURE_INFER_ENDPOINT`
   - `MODEL_LIST` (optional)
 - secrets for sensitive values
+  - `AZURE_ENDPOINTS`
   - `AZURE_API_KEY`
   - `CLIENT_API_KEYS`
   - `MODEL_MAPPING`
 
 You can start with the minimum required set:
 
-- `AZURE_API_KEY`
-- `AZURE_OAI_ENDPOINT` or `AZURE_INFER_ENDPOINT`
+- `AZURE_ENDPOINTS` (`AZURE_API_KEY` is optional if every entry has its own key)
 - `CLIENT_API_KEYS` (recommended)
 
 Add `MODEL_MAPPING` only if you want aliases.
@@ -174,8 +175,7 @@ If your repository is public, keep the Azure endpoints out of `wrangler.toml` an
 Use secrets for sensitive values:
 
 ```bash
-wrangler secret put AZURE_OAI_ENDPOINT
-wrangler secret put AZURE_INFER_ENDPOINT
+wrangler secret put AZURE_ENDPOINTS
 wrangler secret put AZURE_API_KEY
 wrangler secret put CLIENT_API_KEYS
 wrangler secret put MODEL_MAPPING
