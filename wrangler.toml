@@ -1,4 +1,4 @@
-name = "cf-openai-azure-proxy"
+name = "azure-ai"
 main = "cf-openai-azure-proxy.js"
 compatibility_date = "2025-01-01"
 

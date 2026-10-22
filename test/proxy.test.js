@@ -48,8 +48,10 @@ test("non-OpenAI model goes to the inference resource first", async () => {
   assert.equal(calls[0].url, `${INFER}/openai/v1/chat/completions`);
 });
 
-test("alias in the default mapping is rewritten to its deployment", async () => {
-  await worker.fetch(post("/v1/responses", { model: "gpt-chat-latest", input: "hi" }), ENV);
+const ALIAS_ENV = { ...ENV, MODEL_MAPPING: JSON.stringify({ "gpt-chat-latest": "gpt-5.5" }) };
+
+test("MODEL_MAPPING alias is rewritten to its deployment", async () => {
+  await worker.fetch(post("/v1/responses", { model: "gpt-chat-latest", input: "hi" }), ALIAS_ENV);
   assert.equal(calls[0].url, `${OAI}/openai/v1/responses`);
   assert.equal(sentModel(calls[0]), "gpt-5.5");
 });
@@ -116,7 +118,7 @@ test("multipart requests send the deployment name in the form", async () => {
     headers: { Authorization: "Bearer sk-test" },
     body: form
   });
-  await worker.fetch(req, ENV);
+  await worker.fetch(req, ALIAS_ENV);
   assert.equal(calls[0].url, `${OAI}/openai/v1/audio/transcriptions`);
   assert.equal(calls[0].body.get("model"), "gpt-5.5");
   assert.ok(calls[0].body.get("file"));
@@ -152,10 +154,10 @@ test("unsupported path is a 404", async () => {
 });
 
 test("GET /v1/models lists aliases plus MODEL_LIST", async () => {
-  const req = new Request("https://proxy.example.com/v1/models", { headers: { Authorization: "Bearer sk-test" } });
-  const resp = await worker.fetch(req, { ...ENV, MODEL_LIST: "a,b" });
-  const ids = (await resp.json()).data.map((m) => m.id);
-  assert.deepEqual(ids, ["gpt-chat-latest", "a", "b"]);
+  const req = () => new Request("https://proxy.example.com/v1/models", { headers: { Authorization: "Bearer sk-test" } });
+  const ids = async (env) => (await (await worker.fetch(req(), env)).json()).data.map((m) => m.id);
+  assert.deepEqual(await ids({ ...ENV, MODEL_LIST: "a,b" }), ["a", "b"]);
+  assert.deepEqual(await ids({ ...ALIAS_ENV, MODEL_LIST: "a,b" }), ["gpt-chat-latest", "a", "b"]);
 });
 
 const A = "https://a.openai.azure.com";

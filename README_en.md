@@ -90,8 +90,7 @@ Optional. Keys are the model names clients send; values are either the deploymen
 
 - `backend: "oai"` tries Azure OpenAI resources first, `backend: "infer"` tries AI Foundry resources first
 - `endpoint` pins which resource is tried first (the URL or any part of it)
-- without `MODEL_MAPPING`, the built-in mapping only aliases `gpt-chat-latest` to `gpt-5.5`
-- setting `MODEL_MAPPING` replaces the built-in mapping
+- there are no aliases by default
 - mapped names are also listed by `GET /v1/models`
 
 ## Deployment
