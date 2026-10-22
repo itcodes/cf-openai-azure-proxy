@@ -164,16 +164,18 @@ Use `[vars]` in `wrangler.toml` for non-secret values, for example:
 
 ```toml
 [vars]
-AZURE_OAI_ENDPOINT      = "https://your-resource.cognitiveservices.azure.com"
-AZURE_INFER_ENDPOINT    = "https://your-project.services.ai.azure.com"
 MODEL_LIST              = "gpt-5.5,gpt-5.4,grok-4-20,deepseek-r1"
 ALLOWED_ORIGINS         = "https://chat.example.com"
 UPSTREAM_TIMEOUT_MS     = "120000"
 ```
 
+If your repository is public, keep the Azure endpoints out of `wrangler.toml` and set them as secrets instead (see below).
+
 Use secrets for sensitive values:
 
 ```bash
+wrangler secret put AZURE_OAI_ENDPOINT
+wrangler secret put AZURE_INFER_ENDPOINT
 wrangler secret put AZURE_API_KEY
 wrangler secret put CLIENT_API_KEYS
 wrangler secret put MODEL_MAPPING

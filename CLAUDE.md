@@ -52,4 +52,4 @@ When you add or change an env var, update every place that lists it:
 
 New Azure deployments need no change. `DEFAULT_MODEL_LIST` only affects what `GET /v1/models` shows.
 
-`wrangler.toml` `[vars]` holds the maintainer's real Azure hostnames (`yoyo` = OAI resource, `waytoagi` = Inference resource). Never commit secrets there; they go in via `wrangler secret put`.
+The repo is public. Don't commit real Azure hostnames, keys, or client keys anywhere, including `wrangler.toml`, code comments, docs, and tests. The endpoints are set with `wrangler secret put` (locally in the gitignored `.dev.vars`).

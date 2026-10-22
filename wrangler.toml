@@ -7,16 +7,17 @@ compatibility_date = "2025-01-01"
 enabled = true
 
 # Non-secret variables (visible in dashboard, committed to git).
-# Change these to your own Azure resource hostnames before deploying.
+# Note: `wrangler deploy` replaces plain-text vars set in the dashboard with
+# what is listed here, so keep plain vars in this file. Secrets are untouched.
 [vars]
-AZURE_OAI_ENDPOINT      = "https://yoyo.cognitiveservices.azure.com"
-AZURE_INFER_ENDPOINT    = "https://waytoagi.services.ai.azure.com"
 # MODEL_LIST            = "gpt-5.5,gpt-5.4,grok-4-20,deepseek-r1"   # what GET /v1/models shows
 # ALLOWED_ORIGINS       = "https://chat.example.com"
 # UPSTREAM_TIMEOUT_MS   = "120000"
 
 # Secrets — set via CLI, never commit them:
 #
+#   wrangler secret put AZURE_OAI_ENDPOINT   # e.g. https://your-resource.cognitiveservices.azure.com
+#   wrangler secret put AZURE_INFER_ENDPOINT # e.g. https://your-project.services.ai.azure.com
 #   wrangler secret put AZURE_API_KEY        # Required if CLIENT_API_KEYS is configured
 #   wrangler secret put CLIENT_API_KEYS      # sk-xxx,sk-yyy  (comma-separated client allowlist)
 #   wrangler secret put MODEL_MAPPING        # Optional — model aliases (JSON string)
