@@ -13,7 +13,7 @@
 //   AZURE_API_KEY            (Secret) Key for resources listed without their own key
 //   AZURE_OAI_ENDPOINT       legacy single Azure OpenAI resource, appended to AZURE_ENDPOINTS
 //   AZURE_INFER_ENDPOINT     legacy single AI Foundry resource, appended to AZURE_ENDPOINTS
-//   MODEL_MAPPING            optional JSON aliases, see DEFAULT_MAPPING below
+//   MODEL_MAPPING            optional JSON aliases, see parseModelMapping below
 //   MODEL_LIST               optional comma-separated model ids for GET /v1/models
 //   CLIENT_API_KEYS          comma-separated list, e.g. sk-abc,sk-def (optional but recommended)
 //   ALLOWED_ORIGINS          comma-separated browser origins allowed by CORS (optional)
@@ -83,12 +83,11 @@ const MULTIPART_ROUTES = new Set([
 // everything else (grok, deepseek, llama, ...) on AI Foundry resources first.
 const OAI_MODEL_PATTERN = /^(gpt-|chatgpt-|o\d|text-embedding-|dall-e-|whisper|tts-|codex-|sora|computer-use)/i;
 
-// Aliases only. Unmapped model names are used as the deployment name directly.
-// Values are a deployment name, or { deployment, backend: "oai" | "infer" } to
-// pin which resource is tried first.
-const DEFAULT_MAPPING = {
-  "gpt-chat-latest": "gpt-5.5"
-};
+// MODEL_MAPPING holds aliases only; unmapped model names are used as the
+// deployment name directly. Values are a deployment name, or
+// { deployment, backend: "oai" | "infer", endpoint } to pin which resource is
+// tried first.
+const DEFAULT_MAPPING = {};
 
 // What GET /v1/models advertises when MODEL_LIST is unset. Purely cosmetic:
 // models missing here still work.

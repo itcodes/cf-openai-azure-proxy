@@ -93,8 +93,7 @@ OpenAI-compatible client
 
 - `backend: "oai"` 先打 Azure OpenAI 类资源，`backend: "infer"` 先打 AI Foundry 类资源
 - `endpoint` 指定先打哪个资源（填地址或其中一部分即可）
-- 不配置时，内置映射只有 `gpt-chat-latest` -> `gpt-5.5` 这一个别名
-- 配置 `MODEL_MAPPING` 会替换内置映射
+- 默认没有任何别名
 - 映射里的名字也会出现在 `GET /v1/models` 中
 
 ## 部署方式
