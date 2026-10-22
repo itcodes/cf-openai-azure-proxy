@@ -11,7 +11,7 @@
 
 - 客户端继续按 OpenAI 方式请求 `/v1/chat/completions`、`/v1/responses`、`/v1/embeddings` 等接口
 - Cloudflare Worker 把请求转发到 Azure 的 `/openai/v1/*` 接口，客户端的 `model` 直接作为 deployment 名
-- 配置了两个 Azure 资源（Azure OpenAI + Azure AI Foundry）时，按模型名决定先打哪个，找不到 deployment 就自动换另一个
+- 可以配置任意多个 Azure 资源（Azure OpenAI、Azure AI Foundry 混用都行），每个资源可以有自己的 key；按模型名决定先打哪类资源，找不到 deployment 就依次换下一个
 
 它是一个无状态代理，不是聊天应用本体，也不包含数据库、计费、用户系统或管理后台。
 
@@ -44,11 +44,12 @@ OpenAI-compatible client
   -> Cloudflare Worker
   -> 校验 Authorization / CLIENT_API_KEYS
   -> 读取 body.model，如有 MODEL_MAPPING 别名则替换 -> deployment 名
-  -> 决定先打哪个资源
-     - gpt-* / o1 / o3 / text-embedding-* / dall-e-* / whisper / tts-* -> AZURE_OAI_ENDPOINT
-     - 其他（grok、deepseek、llama 等）                                -> AZURE_INFER_ENDPOINT
+  -> 决定资源的尝试顺序
+     - gpt-* / o1 / o3 / text-embedding-* / dall-e-* / whisper / tts-* -> 先打 *.openai.azure.com / *.cognitiveservices.azure.com
+     - 其他（grok、deepseek、llama 等）                                -> 先打 *.services.ai.azure.com
+     - 同类资源之间、以及无法识别的域名，按 AZURE_ENDPOINTS 里的顺序
   -> POST {endpoint}/openai/v1/{path}，model = deployment 名
-  -> 如果该资源返回 404 / 未知模型，自动换另一个资源重试
+  -> 如果该资源返回 404 / 未知模型，依次换下一个资源重试
   -> 把响应原样返回给客户端
 ```
 
@@ -60,9 +61,9 @@ OpenAI-compatible client
 
 | 变量 | 必填 | 说明 |
 |---|---|---|
-| `AZURE_API_KEY` | 推荐 | Azure API Key。设置后，Worker 用它访问 Azure（两个资源共用同一个 key） |
-| `AZURE_OAI_ENDPOINT` | 至少配一个 endpoint | Azure OpenAI 资源，例如 `https://your-resource.cognitiveservices.azure.com` |
-| `AZURE_INFER_ENDPOINT` | 至少配一个 endpoint | Azure AI Foundry 资源，例如 `https://your-project.services.ai.azure.com` |
+| `AZURE_ENDPOINTS` | 是 | Azure 资源列表，逗号或换行分隔，每项写 `地址` 或 `地址\|key`，例如 `https://a.openai.azure.com\|key1,https://b.services.ai.azure.com\|key2` |
+| `AZURE_API_KEY` | 推荐 | 默认 Azure key，给 `AZURE_ENDPOINTS` 里没写 key 的资源使用 |
+| `AZURE_OAI_ENDPOINT` / `AZURE_INFER_ENDPOINT` | 否 | 旧配置方式，仍然兼容，会追加到 `AZURE_ENDPOINTS` 后面，使用 `AZURE_API_KEY` |
 | `CLIENT_API_KEYS` | 推荐 | 逗号分隔，作为客户端访问你这个代理时使用的 key |
 | `ALLOWED_ORIGINS` | 否 | 逗号分隔，仅允许这些浏览器来源通过 CORS 访问，例如 `https://chat.example.com` |
 | `UPSTREAM_TIMEOUT_MS` | 否 | 上游 Azure 请求超时（毫秒），默认 `120000`。控制的是等待首字节的时间，流式返回开始后不受此限 |
@@ -72,7 +73,7 @@ OpenAI-compatible client
 说明：
 
 - 如果设置了 `CLIENT_API_KEYS`，客户端必须用其中某个 key 访问 Worker
-- 如果设置了 `CLIENT_API_KEYS`，也必须同时设置 `AZURE_API_KEY`，避免把客户端 key 错发给 Azure 上游
+- 如果设置了 `CLIENT_API_KEYS`，每个资源都必须有 key（写在 `AZURE_ENDPOINTS` 里，或者设置 `AZURE_API_KEY`），避免把客户端 key 错发给 Azure 上游
 - 如果没有设置 `CLIENT_API_KEYS`，Worker 会放行客户端请求
 - 如果没有设置 `CLIENT_API_KEYS` 且也没有设置 `AZURE_API_KEY`，则会尝试把客户端 `Authorization: Bearer ...` 当作 Azure key 继续透传
 - 如果设置了 `ALLOWED_ORIGINS`，只有这些 Origin 的浏览器请求会拿到 CORS 许可；非浏览器客户端不受影响
@@ -85,11 +86,13 @@ OpenAI-compatible client
 ```json
 {
   "gpt-chat-latest": "gpt-5.5",
-  "my-grok": { "deployment": "grok-4-20", "backend": "infer" }
+  "my-grok": { "deployment": "grok-4-20", "backend": "infer" },
+  "special": { "deployment": "gpt-6-astra", "endpoint": "bkbll.openai.azure.com" }
 }
 ```
 
-- `backend: "oai"` 先打 `AZURE_OAI_ENDPOINT`，`backend: "infer"` 先打 `AZURE_INFER_ENDPOINT`
+- `backend: "oai"` 先打 Azure OpenAI 类资源，`backend: "infer"` 先打 AI Foundry 类资源
+- `endpoint` 指定先打哪个资源（填地址或其中一部分即可）
 - 不配置时，内置映射只有 `gpt-chat-latest` -> `gpt-5.5` 这一个别名
 - 配置 `MODEL_MAPPING` 会替换内置映射
 - 映射里的名字也会出现在 `GET /v1/models` 中
@@ -115,18 +118,16 @@ OpenAI-compatible client
 在 Worker 的 Settings / Variables 中配置这些值：
 
 - 非敏感变量可直接添加为普通变量
-  - `AZURE_OAI_ENDPOINT`
-  - `AZURE_INFER_ENDPOINT`
   - `MODEL_LIST`（可选）
 - 敏感变量建议添加为 secret
+  - `AZURE_ENDPOINTS`
   - `AZURE_API_KEY`
   - `CLIENT_API_KEYS`
   - `MODEL_MAPPING`
 
 可以先只配最小必需项：
 
-- `AZURE_API_KEY`
-- `AZURE_OAI_ENDPOINT` 或 `AZURE_INFER_ENDPOINT`
+- `AZURE_ENDPOINTS`（每项带 key 时可以不设 `AZURE_API_KEY`）
 - `CLIENT_API_KEYS`（建议）
 
 如果需要模型别名，再额外配置 `MODEL_MAPPING`。
@@ -177,8 +178,7 @@ UPSTREAM_TIMEOUT_MS     = "120000"
 敏感信息使用 secret：
 
 ```bash
-wrangler secret put AZURE_OAI_ENDPOINT
-wrangler secret put AZURE_INFER_ENDPOINT
+wrangler secret put AZURE_ENDPOINTS
 wrangler secret put AZURE_API_KEY
 wrangler secret put CLIENT_API_KEYS
 wrangler secret put MODEL_MAPPING
