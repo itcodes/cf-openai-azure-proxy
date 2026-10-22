@@ -20,7 +20,10 @@ jobs:
           node-version: 20
 
       - name: Check worker syntax
-        run: node --check --experimental-default-type=module cf-openai-azure-proxy.js
+        run: node --check cf-openai-azure-proxy.js
+
+      - name: Run tests
+        run: npm test
 
       - name: Check entrypoint shell syntax
         run: sh -n docker-entrypoint.sh

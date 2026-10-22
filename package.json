@@ -1,0 +1,8 @@
+{
+  "name": "cf-openai-azure-proxy",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  }
+}

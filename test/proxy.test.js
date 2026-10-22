@@ -1,0 +1,159 @@
+import { test, beforeEach } from "node:test";
+import assert from "node:assert/strict";
+import worker from "../cf-openai-azure-proxy.js";
+
+const OAI = "https://oai.example.com";
+const INFER = "https://infer.example.com";
+const ENV = {
+  AZURE_API_KEY: "azure-key",
+  AZURE_OAI_ENDPOINT: OAI,
+  AZURE_INFER_ENDPOINT: INFER,
+  CLIENT_API_KEYS: "sk-test"
+};
+
+let calls;
+let responder;
+
+beforeEach(() => {
+  calls = [];
+  responder = () => Response.json({ ok: true });
+  globalThis.fetch = async (url, init) => {
+    const call = { url, init, body: init.body };
+    calls.push(call);
+    return responder(call);
+  };
+});
+
+function post(path, body, headers = {}) {
+  return new Request(`https://proxy.example.com${path}`, {
+    method: "POST",
+    headers: { Authorization: "Bearer sk-test", "Content-Type": "application/json", ...headers },
+    body: JSON.stringify(body)
+  });
+}
+
+const sentModel = (call) => JSON.parse(call.body).model;
+
+test("unmapped OpenAI-family model passes through to the OAI resource", async () => {
+  const resp = await worker.fetch(post("/v1/chat/completions", { model: "gpt-9", messages: [] }), ENV);
+  assert.equal(resp.status, 200);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, `${OAI}/openai/v1/chat/completions`);
+  assert.equal(sentModel(calls[0]), "gpt-9");
+  assert.equal(calls[0].init.headers.get("api-key"), "azure-key");
+});
+
+test("non-OpenAI model goes to the inference resource first", async () => {
+  await worker.fetch(post("/v1/chat/completions", { model: "grok-9" }), ENV);
+  assert.equal(calls[0].url, `${INFER}/openai/v1/chat/completions`);
+});
+
+test("alias in the default mapping is rewritten to its deployment", async () => {
+  await worker.fetch(post("/v1/responses", { model: "gpt-chat-latest", input: "hi" }), ENV);
+  assert.equal(calls[0].url, `${OAI}/openai/v1/responses`);
+  assert.equal(sentModel(calls[0]), "gpt-5.5");
+});
+
+test("MODEL_MAPPING object entry can pin the backend", async () => {
+  const env = { ...ENV, MODEL_MAPPING: JSON.stringify({ mine: { deployment: "gpt-x", backend: "infer" } }) };
+  await worker.fetch(post("/v1/chat/completions", { model: "mine" }), env);
+  assert.equal(calls[0].url, `${INFER}/openai/v1/chat/completions`);
+  assert.equal(sentModel(calls[0]), "gpt-x");
+});
+
+test("missing deployment falls back to the other resource and is remembered", async () => {
+  responder = ({ url }) => url.startsWith(OAI)
+    ? Response.json({ error: { code: "DeploymentNotFound" } }, { status: 404 })
+    : Response.json({ ok: true });
+
+  const first = await worker.fetch(post("/v1/chat/completions", { model: "gpt-oss-1" }), ENV);
+  assert.equal(first.status, 200);
+  assert.deepEqual(calls.map((c) => c.url.split("/openai")[0]), [OAI, INFER]);
+
+  calls = [];
+  await worker.fetch(post("/v1/chat/completions", { model: "gpt-oss-1" }), ENV);
+  assert.deepEqual(calls.map((c) => c.url.split("/openai")[0]), [INFER]);
+});
+
+test("unknown-model 400 triggers fallback, other 400s do not", async () => {
+  responder = ({ url }) => url.startsWith(INFER)
+    ? Response.json({ error: { code: "unknown_model" } }, { status: 400 })
+    : Response.json({ ok: true });
+  const resp = await worker.fetch(post("/v1/chat/completions", { model: "mystery-1" }), ENV);
+  assert.equal(resp.status, 200);
+  assert.equal(calls.length, 2);
+
+  calls = [];
+  responder = () => Response.json({ error: { code: "invalid_prompt" } }, { status: 400 });
+  const bad = await worker.fetch(post("/v1/chat/completions", { model: "mystery-2" }), ENV);
+  assert.equal(bad.status, 400);
+  assert.equal(calls.length, 1);
+  assert.equal((await bad.json()).error.code, "invalid_prompt");
+});
+
+test("last resource's 404 is returned to the client", async () => {
+  responder = () => Response.json({ error: { code: "DeploymentNotFound" } }, { status: 404 });
+  const resp = await worker.fetch(post("/v1/chat/completions", { model: "nowhere" }), ENV);
+  assert.equal(resp.status, 404);
+  assert.equal(calls.length, 2);
+  assert.equal((await resp.json()).error.code, "DeploymentNotFound");
+});
+
+test("only one endpoint configured means no fallback", async () => {
+  responder = () => new Response("nope", { status: 404 });
+  const env = { ...ENV, AZURE_INFER_ENDPOINT: "" };
+  await worker.fetch(post("/v1/chat/completions", { model: "grok-9" }), env);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, `${OAI}/openai/v1/chat/completions`);
+});
+
+test("multipart requests send the deployment name in the form", async () => {
+  const form = new FormData();
+  form.append("model", "gpt-chat-latest");
+  form.append("file", new Blob(["audio"]), "a.wav");
+  const req = new Request("https://proxy.example.com/v1/audio/transcriptions", {
+    method: "POST",
+    headers: { Authorization: "Bearer sk-test" },
+    body: form
+  });
+  await worker.fetch(req, ENV);
+  assert.equal(calls[0].url, `${OAI}/openai/v1/audio/transcriptions`);
+  assert.equal(calls[0].body.get("model"), "gpt-5.5");
+  assert.ok(calls[0].body.get("file"));
+});
+
+test("upstream headers are filtered", async () => {
+  responder = () => new Response("{}", {
+    headers: { "content-type": "application/json", "x-ms-region": "eastus", "x-ratelimit-remaining-tokens": "10" }
+  });
+  const resp = await worker.fetch(post("/v1/embeddings", { model: "text-embedding-3-small", input: "x" }), ENV);
+  assert.equal(resp.headers.get("x-ms-region"), null);
+  assert.equal(resp.headers.get("x-ratelimit-remaining-tokens"), "10");
+});
+
+test("upstream timeout returns 504", async () => {
+  globalThis.fetch = (url, init) => new Promise((_, reject) => {
+    init.signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })));
+  });
+  const resp = await worker.fetch(post("/v1/chat/completions", { model: "gpt-9" }), { ...ENV, UPSTREAM_TIMEOUT_MS: "10" });
+  assert.equal(resp.status, 504);
+});
+
+test("invalid client key is rejected before any upstream call", async () => {
+  const resp = await worker.fetch(post("/v1/chat/completions", { model: "gpt-9" }, { Authorization: "Bearer wrong" }), ENV);
+  assert.equal(resp.status, 401);
+  assert.equal(calls.length, 0);
+});
+
+test("unsupported path is a 404", async () => {
+  const resp = await worker.fetch(post("/v1/openai/deployments/x/chat/completions", { model: "gpt-9" }), ENV);
+  assert.equal(resp.status, 404);
+  assert.equal(calls.length, 0);
+});
+
+test("GET /v1/models lists aliases plus MODEL_LIST", async () => {
+  const req = new Request("https://proxy.example.com/v1/models", { headers: { Authorization: "Bearer sk-test" } });
+  const resp = await worker.fetch(req, { ...ENV, MODEL_LIST: "a,b" });
+  const ids = (await resp.json()).data.map((m) => m.id);
+  assert.deepEqual(ids, ["gpt-chat-latest", "a", "b"]);
+});

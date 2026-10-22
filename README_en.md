@@ -3,15 +3,15 @@
 <a href="./README_en.md">English</a> |
 <a href="./README.md">中文</a>
 
-> An OpenAI-compatible proxy for Cloudflare Workers. It accepts `/v1/*` requests from OpenAI-style clients and forwards them to Azure OpenAI or Azure AI Foundry using the upstream shape each backend expects.
+> An OpenAI-compatible proxy for Cloudflare Workers. It accepts `/v1/*` requests from OpenAI-style clients and forwards them to Azure OpenAI or Azure AI Foundry through Azure's OpenAI-compatible v1 API.
 
 ## What This Project Does
 
 Many desktop and mobile clients only know how to talk to the OpenAI API. This project acts as a thin compatibility layer:
 
 - clients keep calling `/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`, and similar OpenAI-style routes
-- the Worker looks up the requested `model`
-- the request is then forwarded to Azure OpenAI or Azure AI Model Inference
+- the Worker forwards the request to Azure's `/openai/v1/*` API, using the client's `model` as the deployment name
+- with two Azure resources configured (Azure OpenAI + Azure AI Foundry), it picks one from the model name and falls back to the other if the deployment isn't there
 
 This is a stateless proxy. It is not a chatbot app, billing system, admin panel, or database-backed service.
 
@@ -29,45 +29,9 @@ This is a stateless proxy. It is not a chatbot app, billing system, admin panel,
   - `POST /v1/images/edits`
   - `POST /v1/images/variations`
   - `GET /v1/models`
-- Azure OpenAI classic deployment routes
-  - `/openai/deployments/{deployment}/*`
-- Azure OpenAI Responses API
-  - `/openai/responses`
-- Azure AI Model Inference routes
-  - `/models/*`
+- New Azure deployments work without changing code or config, as long as the client uses the deployment name
 - Native streaming passthrough
 - Optional client-side allowlist auth via `CLIENT_API_KEYS`
-
-## Supported Model Categories
-
-The built-in default mapping includes examples for:
-
-- GPT family
-  - `gpt-chat-latest`
-  - `gpt-5.5`
-  - `gpt-5.4`
-  - `gpt-4o`
-  - `gpt-4o-mini`
-  - `o1`
-  - `o3-mini`
-- Image generation
-  - `gpt-image-1`
-  - `gpt-image-1.5`
-  - `dall-e-3`
-- Embeddings
-  - `text-embedding-3-small`
-  - `text-embedding-3-large`
-- Audio
-  - `whisper-1`
-  - `tts-1`
-- Third-party Azure AI Foundry models
-  - `grok-4-20`
-  - `grok-3`
-  - `deepseek-r1`
-  - `deepseek-v3`
-  - `llama-3.3-70b`
-
-What actually works depends on which deployments exist in your Azure resources and how `MODEL_MAPPING` is configured.
 
 ## How It Works
 
@@ -76,13 +40,16 @@ OpenAI-compatible client
   -> /v1/chat/completions | /v1/responses | /v1/embeddings | ...
   -> Cloudflare Worker
   -> validate Authorization / CLIENT_API_KEYS
-  -> read body.model
-  -> resolve backend + deployment from MODEL_MAPPING
-  -> forward to the right Azure upstream
-     - backend=oai   -> {AZURE_OAI_ENDPOINT}/openai/...
-     - backend=infer -> {AZURE_INFER_ENDPOINT}/models/...
+  -> read body.model, apply MODEL_MAPPING alias if any -> deployment name
+  -> pick which resource to try first
+     - gpt-* / o1 / o3 / text-embedding-* / dall-e-* / whisper / tts-* -> AZURE_OAI_ENDPOINT
+     - everything else (grok, deepseek, llama, ...)                  -> AZURE_INFER_ENDPOINT
+  -> POST {endpoint}/openai/v1/{path} with model = deployment name
+  -> if that resource answers 404 / unknown model, retry on the other one
   -> return the upstream response as-is
 ```
+
+The resource that worked is remembered per Worker instance, so a fallback only costs an extra round trip the first time.
 
 ## Environment Variables
 
@@ -90,15 +57,14 @@ Configure these in Cloudflare Workers Variables / Secrets:
 
 | Variable | Required | Description |
 |---|---|---|
-| `AZURE_API_KEY` | Recommended | Azure API key used by the Worker when calling Azure |
-| `AZURE_OAI_ENDPOINT` | Required for Azure OpenAI | Example: `https://your-resource.cognitiveservices.azure.com` |
-| `AZURE_INFER_ENDPOINT` | Required for Azure AI Model Inference | Example: `https://your-project.services.ai.azure.com` |
+| `AZURE_API_KEY` | Recommended | Azure API key used by the Worker when calling Azure (the same key is used for both resources) |
+| `AZURE_OAI_ENDPOINT` | At least one endpoint | Azure OpenAI resource, e.g. `https://your-resource.cognitiveservices.azure.com` |
+| `AZURE_INFER_ENDPOINT` | At least one endpoint | Azure AI Foundry resource, e.g. `https://your-project.services.ai.azure.com` |
 | `CLIENT_API_KEYS` | Recommended | Comma-separated keys accepted by your proxy |
 | `ALLOWED_ORIGINS` | No | Comma-separated browser origins allowed by CORS, for example `https://chat.example.com` |
-| `AZURE_OAI_API_VERSION` | No | Defaults to `2025-04-01-preview` |
-| `AZURE_INFER_API_VERSION` | No | Defaults to `2024-05-01-preview` |
 | `UPSTREAM_TIMEOUT_MS` | No | Timeout for Azure upstream requests in milliseconds, defaults to `120000`. Bounds time-to-first-byte only — streaming bodies are not cut off once they start |
-| `MODEL_MAPPING` | No | JSON string; falls back to the built-in default mapping |
+| `MODEL_MAPPING` | No | JSON aliases, see below. Only needed when a client-facing name differs from the deployment name |
+| `MODEL_LIST` | No | Comma-separated model ids returned by `GET /v1/models`; defaults to a built-in list of common models |
 
 Notes:
 
@@ -107,48 +73,23 @@ Notes:
 - if `CLIENT_API_KEYS` is not set, client auth is skipped
 - if `CLIENT_API_KEYS` is not set and `AZURE_API_KEY` is also not set, the Worker will try to forward the client's `Authorization: Bearer ...` value as the Azure key
 - if `ALLOWED_ORIGINS` is set, only those browser origins receive CORS access; non-browser clients are unaffected
+- `api-version` is no longer needed: the v1 API doesn't take one
 
 ## MODEL_MAPPING Format
 
-`MODEL_MAPPING` is a JSON object where each key is the model name seen by the client, and each value tells the Worker which backend and deployment to use.
-
-Example:
+Optional. Keys are the model names clients send; values are either the deployment name, or an object that also pins which resource to try first:
 
 ```json
 {
-  "gpt-chat-latest": {
-    "backend": "oai",
-    "deployment": "gpt-5.5"
-  },
-  "gpt-5.5": {
-    "backend": "oai",
-    "deployment": "gpt-5.5"
-  },
-  "gpt-5.4": {
-    "backend": "oai",
-    "deployment": "gpt-5.4"
-  },
-  "gpt-4o": {
-    "backend": "oai",
-    "deployment": "gpt-4o"
-  },
-  "grok-4-20": {
-    "backend": "infer",
-    "deployment": "grok-4-20"
-  },
-  "deepseek-r1": {
-    "backend": "infer",
-    "deployment": "deepseek-r1"
-  }
+  "gpt-chat-latest": "gpt-5.5",
+  "my-grok": { "deployment": "grok-4-20", "backend": "infer" }
 }
 ```
 
-Rules:
-
-- `backend: "oai"` routes to Azure OpenAI
-- `backend: "infer"` routes to Azure AI Model Inference
-- `deployment` must match the real deployment name in Azure
-- optional `apiVersion` can override the default API version for that entry
+- `backend: "oai"` tries `AZURE_OAI_ENDPOINT` first, `backend: "infer"` tries `AZURE_INFER_ENDPOINT` first
+- without `MODEL_MAPPING`, the built-in mapping only aliases `gpt-chat-latest` to `gpt-5.5`
+- setting `MODEL_MAPPING` replaces the built-in mapping
+- mapped names are also listed by `GET /v1/models`
 
 ## Deployment
 
@@ -173,8 +114,7 @@ In the Worker Settings / Variables page, add:
 - regular variables for non-sensitive values
   - `AZURE_OAI_ENDPOINT`
   - `AZURE_INFER_ENDPOINT`
-  - `AZURE_OAI_API_VERSION`
-  - `AZURE_INFER_API_VERSION`
+  - `MODEL_LIST` (optional)
 - secrets for sensitive values
   - `AZURE_API_KEY`
   - `CLIENT_API_KEYS`
@@ -186,7 +126,7 @@ You can start with the minimum required set:
 - `AZURE_OAI_ENDPOINT` or `AZURE_INFER_ENDPOINT`
 - `CLIENT_API_KEYS` (recommended)
 
-Add `MODEL_MAPPING` only if you want to override the built-in mapping.
+Add `MODEL_MAPPING` only if you want aliases.
 
 #### 4. Deploy and use the Worker URL
 
@@ -226,8 +166,7 @@ Use `[vars]` in `wrangler.toml` for non-secret values, for example:
 [vars]
 AZURE_OAI_ENDPOINT      = "https://your-resource.cognitiveservices.azure.com"
 AZURE_INFER_ENDPOINT    = "https://your-project.services.ai.azure.com"
-AZURE_OAI_API_VERSION   = "2025-04-01-preview"
-AZURE_INFER_API_VERSION = "2024-05-01-preview"
+MODEL_LIST              = "gpt-5.5,gpt-5.4,grok-4-20,deepseek-r1"
 ALLOWED_ORIGINS         = "https://chat.example.com"
 UPSTREAM_TIMEOUT_MS     = "120000"
 ```
@@ -255,15 +194,15 @@ For an OpenAI-compatible client:
 - Base URL: `https://your-worker.your-subdomain.workers.dev/v1`
 - API Key: one of the keys listed in `CLIENT_API_KEYS`
 
-Clients that support the newer Responses API can use the same base URL; the proxy will translate `/v1/responses` to Azure's `/openai/responses`.
+Clients that support the newer Responses API can use the same base URL; the proxy forwards `/v1/responses` to Azure's `/openai/v1/responses`.
 
 ## Notes
 
 - manual deployment and Wrangler deployment behave the same after release; the main difference is how you publish updates
-- `GET /v1/models` reflects the configured mapping, not Azure auto-discovery
+- `GET /v1/models` returns `MODEL_MAPPING` keys plus `MODEL_LIST`, not Azure auto-discovery (listing deployments needs Azure management credentials, not an API key). Models missing from the list still work
 - a model only works if the corresponding endpoint and deployment are actually configured in Azure
 - the proxy now forwards only a small whitelist of safe response headers instead of exposing Azure-specific `x-ms-*` or `apim-*` headers as-is
-- this project intentionally stays small: it does not implement retries, caching, quotas, auditing, or multi-tenant management
+- this project intentionally stays small: apart from the resource fallback above, it does not implement retries, caching, quotas, auditing, or multi-tenant management
 - the repository also ships a Docker image, but it runs `wrangler dev --local` and is meant for local debugging rather than production deployment
 
 ## Main Files

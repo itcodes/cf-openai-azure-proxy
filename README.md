@@ -3,15 +3,15 @@
 <a href="./README_en.md">English</a> |
 <a href="./README.md">中文</a>
 
-> 一个运行在 Cloudflare Workers 上的 OpenAI 兼容代理。它把客户端发来的 `/v1/*` 请求转成 Azure OpenAI / Azure AI Foundry 可接受的上游请求，让只支持 OpenAI API 的客户端也能接入 Azure 上部署的模型。
+> 一个运行在 Cloudflare Workers 上的 OpenAI 兼容代理。它把客户端发来的 `/v1/*` 请求通过 Azure 的 OpenAI 兼容 v1 接口转发到 Azure OpenAI / Azure AI Foundry，让只支持 OpenAI API 的客户端也能接入 Azure 上部署的模型。
 
 ## 这个项目做什么
 
 很多客户端只支持 OpenAI 风格接口，但不直接支持 Azure OpenAI / Azure AI Foundry。本项目提供一个很轻量的协议转换层：
 
 - 客户端继续按 OpenAI 方式请求 `/v1/chat/completions`、`/v1/responses`、`/v1/embeddings` 等接口
-- Cloudflare Worker 根据 `model` 字段查找映射关系
-- 再把请求转发到 Azure OpenAI 或 Azure AI Model Inference
+- Cloudflare Worker 把请求转发到 Azure 的 `/openai/v1/*` 接口，客户端的 `model` 直接作为 deployment 名
+- 配置了两个 Azure 资源（Azure OpenAI + Azure AI Foundry）时，按模型名决定先打哪个，找不到 deployment 就自动换另一个
 
 它是一个无状态代理，不是聊天应用本体，也不包含数据库、计费、用户系统或管理后台。
 
@@ -29,46 +29,10 @@
   - `POST /v1/images/edits`
   - `POST /v1/images/variations`
   - `GET /v1/models`
-- Azure OpenAI 经典接口
-  - `/openai/deployments/{deployment}/*`
-- Azure OpenAI Responses API
-  - `/openai/responses`
-- Azure AI Model Inference
-  - `/models/*`
+- 在 Azure 新部署的模型无需改代码或配置，客户端填 deployment 名即可使用
 - SSE 流式透传
 - 简单客户端鉴权
   - 用 `CLIENT_API_KEYS` 给你的 Worker 再包一层访问控制
-
-## 支持的模型类型
-
-默认映射里已经给了这些示例：
-
-- GPT 系列
-  - `gpt-chat-latest`
-  - `gpt-5.5`
-  - `gpt-5.4`
-  - `gpt-4o`
-  - `gpt-4o-mini`
-  - `o1`
-  - `o3-mini`
-- 图像
-  - `gpt-image-1`
-  - `gpt-image-1.5`
-  - `dall-e-3`
-- Embeddings
-  - `text-embedding-3-small`
-  - `text-embedding-3-large`
-- 语音
-  - `whisper-1`
-  - `tts-1`
-- Azure AI Foundry 第三方模型
-  - `grok-4-20`
-  - `grok-3`
-  - `deepseek-r1`
-  - `deepseek-v3`
-  - `llama-3.3-70b`
-
-实际可用模型取决于你在 Azure 中部署了什么，以及 `MODEL_MAPPING` 如何配置。
 
 ## 工作方式
 
@@ -79,13 +43,16 @@ OpenAI-compatible client
   -> /v1/chat/completions | /v1/responses | /v1/embeddings | ...
   -> Cloudflare Worker
   -> 校验 Authorization / CLIENT_API_KEYS
-  -> 读取 body.model
-  -> 根据 MODEL_MAPPING 找到 backend + deployment
-  -> 转发到对应 Azure 上游
-     - backend=oai   -> {AZURE_OAI_ENDPOINT}/openai/...
-     - backend=infer -> {AZURE_INFER_ENDPOINT}/models/...
+  -> 读取 body.model，如有 MODEL_MAPPING 别名则替换 -> deployment 名
+  -> 决定先打哪个资源
+     - gpt-* / o1 / o3 / text-embedding-* / dall-e-* / whisper / tts-* -> AZURE_OAI_ENDPOINT
+     - 其他（grok、deepseek、llama 等）                                -> AZURE_INFER_ENDPOINT
+  -> POST {endpoint}/openai/v1/{path}，model = deployment 名
+  -> 如果该资源返回 404 / 未知模型，自动换另一个资源重试
   -> 把响应原样返回给客户端
 ```
+
+成功的资源会在 Worker 实例内记住，所以回退只在第一次多一次往返。
 
 ## 环境变量
 
@@ -93,15 +60,14 @@ OpenAI-compatible client
 
 | 变量 | 必填 | 说明 |
 |---|---|---|
-| `AZURE_API_KEY` | 推荐 | Azure API Key。设置后，Worker 用它访问 Azure |
-| `AZURE_OAI_ENDPOINT` | 使用 Azure OpenAI 时必填 | 例如 `https://your-resource.cognitiveservices.azure.com` |
-| `AZURE_INFER_ENDPOINT` | 使用 Azure AI Model Inference 时必填 | 例如 `https://your-project.services.ai.azure.com` |
+| `AZURE_API_KEY` | 推荐 | Azure API Key。设置后，Worker 用它访问 Azure（两个资源共用同一个 key） |
+| `AZURE_OAI_ENDPOINT` | 至少配一个 endpoint | Azure OpenAI 资源，例如 `https://your-resource.cognitiveservices.azure.com` |
+| `AZURE_INFER_ENDPOINT` | 至少配一个 endpoint | Azure AI Foundry 资源，例如 `https://your-project.services.ai.azure.com` |
 | `CLIENT_API_KEYS` | 推荐 | 逗号分隔，作为客户端访问你这个代理时使用的 key |
 | `ALLOWED_ORIGINS` | 否 | 逗号分隔，仅允许这些浏览器来源通过 CORS 访问，例如 `https://chat.example.com` |
-| `AZURE_OAI_API_VERSION` | 否 | 默认 `2025-04-01-preview` |
-| `AZURE_INFER_API_VERSION` | 否 | 默认 `2024-05-01-preview` |
 | `UPSTREAM_TIMEOUT_MS` | 否 | 上游 Azure 请求超时（毫秒），默认 `120000`。控制的是等待首字节的时间，流式返回开始后不受此限 |
-| `MODEL_MAPPING` | 否 | JSON 字符串；不填时使用代码内置默认映射 |
+| `MODEL_MAPPING` | 否 | JSON 别名表，见下文。只有客户端用的名字和 deployment 名不一致时才需要 |
+| `MODEL_LIST` | 否 | 逗号分隔，`GET /v1/models` 返回的模型列表；不填时使用内置的常见模型列表 |
 
 说明：
 
@@ -110,48 +76,23 @@ OpenAI-compatible client
 - 如果没有设置 `CLIENT_API_KEYS`，Worker 会放行客户端请求
 - 如果没有设置 `CLIENT_API_KEYS` 且也没有设置 `AZURE_API_KEY`，则会尝试把客户端 `Authorization: Bearer ...` 当作 Azure key 继续透传
 - 如果设置了 `ALLOWED_ORIGINS`，只有这些 Origin 的浏览器请求会拿到 CORS 许可；非浏览器客户端不受影响
+- 不再需要配置 `api-version`，v1 接口不使用它
 
 ## MODEL_MAPPING 格式
 
-`MODEL_MAPPING` 是一个 JSON 对象，key 是客户端使用的模型名，value 描述这个模型要转发到哪个 Azure 后端和 deployment。
-
-示例：
+可选。key 是客户端使用的模型名，value 可以直接写 deployment 名，也可以写成对象，额外指定先打哪个资源：
 
 ```json
 {
-  "gpt-chat-latest": {
-    "backend": "oai",
-    "deployment": "gpt-5.5"
-  },
-  "gpt-5.5": {
-    "backend": "oai",
-    "deployment": "gpt-5.5"
-  },
-  "gpt-5.4": {
-    "backend": "oai",
-    "deployment": "gpt-5.4"
-  },
-  "gpt-4o": {
-    "backend": "oai",
-    "deployment": "gpt-4o"
-  },
-  "grok-4-20": {
-    "backend": "infer",
-    "deployment": "grok-4-20"
-  },
-  "deepseek-r1": {
-    "backend": "infer",
-    "deployment": "deepseek-r1"
-  }
+  "gpt-chat-latest": "gpt-5.5",
+  "my-grok": { "deployment": "grok-4-20", "backend": "infer" }
 }
 ```
 
-规则：
-
-- `backend: "oai"` 表示走 Azure OpenAI
-- `backend: "infer"` 表示走 Azure AI Model Inference
-- `deployment` 填你在 Azure 中实际创建的 deployment 名
-- 可选 `apiVersion` 可覆盖默认 API 版本
+- `backend: "oai"` 先打 `AZURE_OAI_ENDPOINT`，`backend: "infer"` 先打 `AZURE_INFER_ENDPOINT`
+- 不配置时，内置映射只有 `gpt-chat-latest` -> `gpt-5.5` 这一个别名
+- 配置 `MODEL_MAPPING` 会替换内置映射
+- 映射里的名字也会出现在 `GET /v1/models` 中
 
 ## 部署方式
 
@@ -176,8 +117,7 @@ OpenAI-compatible client
 - 非敏感变量可直接添加为普通变量
   - `AZURE_OAI_ENDPOINT`
   - `AZURE_INFER_ENDPOINT`
-  - `AZURE_OAI_API_VERSION`
-  - `AZURE_INFER_API_VERSION`
+  - `MODEL_LIST`（可选）
 - 敏感变量建议添加为 secret
   - `AZURE_API_KEY`
   - `CLIENT_API_KEYS`
@@ -189,7 +129,7 @@ OpenAI-compatible client
 - `AZURE_OAI_ENDPOINT` 或 `AZURE_INFER_ENDPOINT`
 - `CLIENT_API_KEYS`（建议）
 
-如果你想自定义模型映射，再额外配置 `MODEL_MAPPING`。
+如果需要模型别名，再额外配置 `MODEL_MAPPING`。
 
 #### 4. 部署并拿到地址
 
@@ -229,8 +169,7 @@ wrangler login
 [vars]
 AZURE_OAI_ENDPOINT      = "https://your-resource.cognitiveservices.azure.com"
 AZURE_INFER_ENDPOINT    = "https://your-project.services.ai.azure.com"
-AZURE_OAI_API_VERSION   = "2025-04-01-preview"
-AZURE_INFER_API_VERSION = "2024-05-01-preview"
+MODEL_LIST              = "gpt-5.5,gpt-5.4,grok-4-20,deepseek-r1"
 ALLOWED_ORIGINS         = "https://chat.example.com"
 UPSTREAM_TIMEOUT_MS     = "120000"
 ```
@@ -258,15 +197,15 @@ wrangler deploy
 - Base URL: `https://your-worker.your-subdomain.workers.dev/v1`
 - API Key: `CLIENT_API_KEYS` 中你自定义的某个 key
 
-对于支持新版 Responses API 的客户端，同样填这个 Base URL 即可，代理会把 `/v1/responses` 自动转给 Azure 的 `/openai/responses`。
+对于支持新版 Responses API 的客户端，同样填这个 Base URL 即可，代理会把 `/v1/responses` 转给 Azure 的 `/openai/v1/responses`。
 
 ## 注意事项
 
 - 手动部署和 Wrangler 部署的运行效果是一样的，区别主要在发布方式
-- `GET /v1/models` 返回的是映射表里的模型列表，不是 Azure 自动探测结果
-- 只有配置了相应 endpoint 和 deployment 的模型才能真正调用成功
+- `GET /v1/models` 返回的是 `MODEL_MAPPING` 的 key 加上 `MODEL_LIST`，不是 Azure 自动探测结果（列出 deployment 需要 Azure 管理凭据，API key 做不到）。不在列表里的模型照样能调用
+- 只有在 Azure 中实际部署了的模型才能调用成功
 - 代理默认只透传一小部分安全响应头，不会把 Azure 的 `x-ms-*`、`apim-*` 等内部头原样暴露给客户端
-- 本项目默认只做协议转换和透传，不做重试、缓存、配额、审计或多租户管理
+- 本项目默认只做协议转换和透传，除上面的资源回退外，不做重试、缓存、配额、审计或多租户管理
 - 仓库也提供 Docker 镜像，但它运行的是 `wrangler dev --local`，定位是本地调试，不建议当生产部署方式使用
 
 ## 主要文件
