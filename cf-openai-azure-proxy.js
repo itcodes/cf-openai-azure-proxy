@@ -127,13 +127,14 @@ export default {
         return listModels(cfg, request);
       }
 
-      if (MULTIPART_ROUTES.has(path)) {
-        return proxyMultipart(request, path, cfg);
-      }
-
       if (request.method !== "POST") {
         return errorResponse(404, "not_found", `No handler for ${request.method} ${path}`, request, cfg);
       }
+
+      if (MULTIPART_ROUTES.has(path)) {
+        return await proxyMultipart(request, path, cfg);
+      }
+
       if (!JSON_ROUTES.has(path)) {
         return errorResponse(404, "not_found", `Unsupported path: ${url.pathname}`, request, cfg);
       }
@@ -149,7 +150,7 @@ export default {
       }
 
       const target = resolveModel(modelName, cfg);
-      return proxyToAzure(
+      return await proxyToAzure(
         request,
         cfg,
         path,
@@ -158,7 +159,11 @@ export default {
         { "Content-Type": "application/json" }
       );
     } catch (e) {
-      return errorResponse(500, "proxy_error", e.message || String(e), request, cfg);
+      // Details go to the worker log only: this runs before client auth when
+      // the config is broken, and the message may describe secret values.
+      logRequest({ status: 500, error: e.message || String(e) });
+      const message = cfg ? "Internal proxy error" : "Proxy is misconfigured; see worker logs";
+      return errorResponse(500, "proxy_error", message, request, cfg);
     }
   }
 };
@@ -197,12 +202,13 @@ function parseEndpoints(env) {
 
   const seen = new Set();
   const endpoints = [];
-  for (const entry of entries) {
+  for (const [i, entry] of entries.entries()) {
     let parsed;
     try {
       parsed = new URL(entry.url);
     } catch {
-      throw new Error(`Invalid Azure endpoint URL: ${entry.url}`);
+      // Don't echo the value: a swapped `key|url` would put the key in the logs.
+      throw new Error(`Invalid Azure endpoint URL (entry #${i + 1})`);
     }
     const url = stripTrailingSlash(parsed.origin + parsed.pathname);
     if (seen.has(url)) continue;
@@ -409,7 +415,7 @@ async function proxyToAzure(request, cfg, path, target, body, extraHeaders = {})
       if (!isLast) continue;
       if (held) return send(held.resp, held.endpoint);
       log(502, { error: String(e && e.message || e) });
-      throw e;
+      return errorResponse(502, "upstream_error", "Azure upstream request failed", request, cfg);
     }
     attempts.push(`${hostOf(endpoint.url)}:${resp.status}`);
 
@@ -471,7 +477,12 @@ async function fetchUpstream(cfg, upstreamUrl, azureKey, body, extraHeaders) {
 
 async function proxyMultipart(request, path, cfg) {
   // Parse form to extract `model`, then rebuild with the deployment name.
-  const form = await request.formData();
+  let form;
+  try {
+    form = await request.formData();
+  } catch {
+    return errorResponse(400, "invalid_request_error", "Request body must be multipart/form-data", request, cfg);
+  }
   const modelName = form.get("model");
   if (typeof modelName !== "string" || !modelName) {
     return errorResponse(400, "invalid_request_error", "Missing 'model' field in form", request, cfg, "model");

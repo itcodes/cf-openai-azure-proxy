@@ -214,14 +214,25 @@ test("AZURE_ENDPOINTS entries without a key fall back to AZURE_API_KEY, legacy v
 test("CLIENT_API_KEYS requires a key for every endpoint", async () => {
   const resp = await worker.fetch(post("/v1/chat/completions", { model: "gpt-9" }), { CLIENT_API_KEYS: "sk-test", AZURE_ENDPOINTS: `${A}|k,${B}` });
   assert.equal(resp.status, 500);
-  assert.match((await resp.json()).error.message, /AZURE_API_KEY/);
+  assert.match((await resp.json()).error.message, /misconfigured/);
+  assert.match(logs.at(-1).error, /AZURE_API_KEY/);
   assert.equal(calls.length, 0);
 });
 
 test("invalid endpoint URL is a config error", async () => {
   const resp = await worker.fetch(post("/v1/chat/completions", { model: "gpt-9" }), { AZURE_API_KEY: "k", AZURE_ENDPOINTS: "not a url" });
   assert.equal(resp.status, 500);
-  assert.match((await resp.json()).error.message, /Invalid Azure endpoint URL/);
+  assert.match((await resp.json()).error.message, /misconfigured/);
+  assert.match(logs.at(-1).error, /Invalid Azure endpoint URL \(entry #1\)/);
+});
+
+test("config errors are not echoed to the client or the log", async () => {
+  const env = { CLIENT_API_KEYS: "sk-test", AZURE_ENDPOINTS: "sk-swapped-secret|https://a.example.com" };
+  const resp = await worker.fetch(post("/v1/chat/completions", { model: "gpt-9" }, { Authorization: "Bearer anyone" }), env);
+  assert.equal(resp.status, 500);
+  assert.equal(resp.headers.get("access-control-allow-origin"), "*");
+  const raw = (await resp.text()) + JSON.stringify(logs);
+  assert.ok(!raw.includes("sk-swapped-secret"));
 });
 
 const hostsOf = () => calls.map((c) => c.url.split("/openai")[0]);
@@ -292,4 +303,36 @@ test("each upstream request logs one line without keys or content", async () => 
 test("rejected client keys are logged", async () => {
   await worker.fetch(post("/v1/chat/completions", { model: "gpt-9" }, { Authorization: "Bearer wrong" }), ENV);
   assert.deepEqual(logs, [{ path: "/chat/completions", status: 401, error: "invalid_client_key" }]);
+});
+
+test("network error on every resource returns an OpenAI-shaped 502", async () => {
+  responder = () => { throw new TypeError("fetch failed"); };
+  const resp = await worker.fetch(post("/v1/chat/completions", { model: "gpt-down-1" }), ENV);
+  assert.equal(resp.status, 502);
+  assert.equal((await resp.json()).error.type, "upstream_error");
+  assert.equal(resp.headers.get("access-control-allow-origin"), "*");
+  assert.equal(logs.at(-1).status, 502);
+});
+
+test("unexpected errors while proxying are caught and returned as 500", async () => {
+  // A 400 whose body can't be cloned makes classifyUpstream throw.
+  responder = () => ({ status: 400, headers: new Headers(), clone() { throw new Error("boom"); } });
+  const resp = await worker.fetch(post("/v1/chat/completions", { model: "gpt-down-2" }), ENV);
+  assert.equal(resp.status, 500);
+  assert.equal((await resp.json()).error.message, "Internal proxy error");
+  assert.equal(logs.at(-1).error, "boom");
+});
+
+test("GET on a multipart route is a 404, not a crash", async () => {
+  const req = new Request("https://proxy.example.com/v1/audio/transcriptions", { headers: { Authorization: "Bearer sk-test" } });
+  const resp = await worker.fetch(req, ENV);
+  assert.equal(resp.status, 404);
+  assert.equal(calls.length, 0);
+});
+
+test("multipart route with a non-form body is a 400, not a crash", async () => {
+  const resp = await worker.fetch(post("/v1/audio/transcriptions", { model: "whisper-1" }), ENV);
+  assert.equal(resp.status, 400);
+  assert.equal((await resp.json()).error.type, "invalid_request_error");
+  assert.equal(calls.length, 0);
 });
